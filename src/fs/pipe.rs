@@ -61,6 +61,10 @@ impl PipeReader {
 #[async_trait]
 impl FileOps for PipeReader {
     async fn read(&mut self, _ctx: &mut FileCtx, u_buf: UA, count: usize) -> Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+
         self.do_read(self.inner.buf.copy_to_user(u_buf, count))
             .await
     }
@@ -132,6 +136,10 @@ impl FileOps for PipeWriter {
     }
 
     async fn write(&mut self, _ctx: &mut FileCtx, u_buf: UA, count: usize) -> Result<usize> {
+        if count == 0 {
+            return Ok(0);
+        }
+
         self.do_write(self.inner.buf.copy_from_user(u_buf, count))
             .await
     }

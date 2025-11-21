@@ -12,6 +12,33 @@ use crate::kernel::kpipe::KPipe;
 
 use super::{dir::OpenFileDirIter, open_file::FileCtx, syscalls::iov::IoVec};
 
+macro_rules! process_iovec {
+    ($iovecs:expr, |$addr:ident, $count:ident| $call:expr) => {
+        async {
+            let mut total_bytes = 0;
+            for vec in $iovecs {
+
+                if vec.iov_len == 0 {
+                    continue;
+                }
+
+                let $addr = vec.iov_base;
+                let $count = vec.iov_len;
+
+                let bytes = { $call }.await?;
+
+                total_bytes += bytes;
+
+                if bytes != vec.iov_len {
+                    break;
+                }
+            }
+
+            Ok::<usize, KernelError>(total_bytes)
+        }
+    };
+}
+
 #[async_trait]
 pub trait FileOps: Send + Sync {
     /// Reads data from the current file position into `buf`.
@@ -23,21 +50,7 @@ pub trait FileOps: Send + Sync {
     async fn write(&mut self, ctx: &mut FileCtx, buf: UA, count: usize) -> Result<usize>;
 
     async fn readv(&mut self, ctx: &mut FileCtx, iovecs: &[IoVec]) -> Result<usize> {
-        let mut total_read = 0;
-
-        for vec in iovecs {
-            //TODO: think about optimising the below. Each call to read will
-            // allocate and deallocate a page.
-            let bytes_read = self.read(ctx, vec.iov_base, vec.iov_len).await?;
-
-            total_read += bytes_read;
-
-            if bytes_read != vec.iov_len {
-                return Ok(total_read);
-            }
-        }
-
-        Ok(total_read)
+        process_iovec!(iovecs, |addr, count| self.read(ctx, addr, count)).await
     }
 
     async fn readdir<'a>(&'a mut self, _ctx: &'a mut FileCtx) -> Result<OpenFileDirIter<'a>> {
@@ -45,21 +58,7 @@ pub trait FileOps: Send + Sync {
     }
 
     async fn writev(&mut self, ctx: &mut FileCtx, iovecs: &[IoVec]) -> Result<usize> {
-        let mut total_written = 0;
-
-        for vec in iovecs {
-            //TODO: think about optimising the below. Each call to read will
-            // allocate and deallocate a page.
-            let bytes_written = self.write(ctx, vec.iov_base, vec.iov_len).await?;
-
-            total_written += bytes_written;
-
-            if bytes_written != vec.iov_len {
-                return Ok(total_written);
-            }
-        }
-
-        Ok(total_written)
+        process_iovec!(iovecs, |addr, count| self.write(ctx, addr, count)).await
     }
 
     /// Puts the current task to sleep until a call to `read()` would no longer
