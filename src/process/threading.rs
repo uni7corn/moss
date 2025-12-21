@@ -28,7 +28,11 @@ impl FutexWaitQueue {
 }
 
 /// Global futex table mapping a user address to its wait queue.
-static FUTEX_TABLE: OnceLock<SpinLock<BTreeMap<usize, Arc<SpinLock<FutexWaitQueue>>>>> =
+// TODO: statically allocate an array of SpinLock<Vec<FutexWaitQueue>>.
+// Then hash into that table to find it's bucket
+// TODO: Should be physical address, not user address
+#[allow(clippy::type_complexity)]
+static FUTEX_TABLE: OnceLock<SpinLock<BTreeMap<TUA<u32>, Arc<SpinLock<FutexWaitQueue>>>>> =
     OnceLock::new();
 
 pub async fn sys_set_tid_address(_tidptr: VA) -> Result<usize> {
@@ -98,23 +102,17 @@ pub async fn sys_futex(
             let waitq_arc = {
                 let mut guard = table.lock_save_irq();
                 guard
-                    .entry(uaddr.value())
+                    .entry(uaddr)
                     .or_insert_with(|| Arc::new(SpinLock::new(FutexWaitQueue::new())))
                     .clone()
             };
 
-            // First read – may fault and therefore is done outside the lock.
             let current: u32 = copy_from_user(uaddr).await?;
             if current != val {
                 return Err(KernelError::TryAgain);
             }
 
-            // Second read – ensures the value is still what we expect *after*
-            // the wait-queue entry is visible to other threads.
-            if copy_from_user(uaddr).await? != val {
-                return Err(KernelError::TryAgain);
-            }
-
+            // TODO: When we have try_ variants of locking primitives, use them here
             wait_until(
                 waitq_arc.clone(),
                 |state| &mut state.wakers,
@@ -137,7 +135,7 @@ pub async fn sys_futex(
             let mut woke = 0;
 
             if let Some(table) = FUTEX_TABLE.get()
-                && let Some(waitq_arc) = table.lock_save_irq().get(&uaddr.value()).cloned()
+                && let Some(waitq_arc) = table.lock_save_irq().get(&uaddr).cloned()
             {
                 let mut waitq = waitq_arc.lock_save_irq();
                 for _ in 0..nr_wake {
