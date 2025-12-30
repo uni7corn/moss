@@ -1,7 +1,7 @@
 use crate::{
     fs::{DummyInode, VFS},
     process::{Task, fd_table::Fd},
-    sched::current_task,
+    sched::current::current_task_shared,
 };
 use alloc::sync::Arc;
 use libkernel::{
@@ -41,7 +41,7 @@ async fn resolve_at_start_node(dirfd: Fd, path: &Path, flags: AtFlags) -> Result
         // just return a dummy, since it'll operate on dirfd anyways
         return Ok(Arc::new(DummyInode {}));
     }
-    let task = current_task();
+    let task = current_task_shared();
 
     let start_node: Arc<dyn Inode> = if path.is_absolute() {
         // Absolute path ignores dirfd.
@@ -73,7 +73,7 @@ async fn resolve_path_flags(
     dirfd: Fd,
     path: &Path,
     root: Arc<dyn Inode>,
-    task: Arc<Task>,
+    task: &Arc<Task>,
     flags: AtFlags,
 ) -> Result<Arc<dyn Inode>> {
     // simply return the inode that dirfd refers to

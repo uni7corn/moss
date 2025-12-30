@@ -2,7 +2,7 @@ use core::convert::Infallible;
 
 use crate::{
     memory::uaccess::{UserCopyable, copy_to_user},
-    sched::current_task,
+    sched::current::current_task,
 };
 use libkernel::{
     error::Result,
@@ -100,8 +100,7 @@ pub fn sys_gettid() -> core::result::Result<usize, Infallible> {
 }
 
 pub async fn sys_getresuid(ruid: TUA<Uid>, euid: TUA<Uid>, suid: TUA<Uid>) -> Result<usize> {
-    let task = current_task();
-    let creds = task.creds.lock_save_irq().clone();
+    let creds = current_task().creds.lock_save_irq().clone();
 
     copy_to_user(ruid, creds.uid).await?;
     copy_to_user(euid, creds.euid).await?;
@@ -111,8 +110,7 @@ pub async fn sys_getresuid(ruid: TUA<Uid>, euid: TUA<Uid>, suid: TUA<Uid>) -> Re
 }
 
 pub async fn sys_getresgid(rgid: TUA<Gid>, egid: TUA<Gid>, sgid: TUA<Gid>) -> Result<usize> {
-    let task = current_task();
-    let creds = task.creds.lock_save_irq().clone();
+    let creds = current_task().creds.lock_save_irq().clone();
 
     copy_to_user(rgid, creds.gid).await?;
     copy_to_user(egid, creds.egid).await?;

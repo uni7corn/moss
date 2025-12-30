@@ -1,4 +1,4 @@
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use libkernel::UserAddressSpace;
 use libkernel::error::{KernelError, Result};
 use libkernel::memory::address::{TUA, VA};

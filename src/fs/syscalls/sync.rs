@@ -1,6 +1,6 @@
 use libkernel::error::{KernelError, Result};
 
-use crate::{fs::VFS, process::fd_table::Fd, sched::current_task};
+use crate::{fs::VFS, process::fd_table::Fd, sched::current::current_task_shared};
 
 pub async fn sys_sync() -> Result<usize> {
     VFS.sync_all().await?;
@@ -8,7 +8,7 @@ pub async fn sys_sync() -> Result<usize> {
 }
 
 pub async fn sys_syncfs(fd: Fd) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     let inode = task
         .fd_table
@@ -23,7 +23,7 @@ pub async fn sys_syncfs(fd: Fd) -> Result<usize> {
 }
 
 pub async fn sys_fsync(fd: Fd) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     let inode = task
         .fd_table
@@ -38,7 +38,7 @@ pub async fn sys_fsync(fd: Fd) -> Result<usize> {
 }
 
 pub async fn sys_fdatasync(fd: Fd) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     let inode = task
         .fd_table

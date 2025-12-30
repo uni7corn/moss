@@ -1,4 +1,4 @@
-use crate::{process::ProcVM, sched::current_task};
+use crate::{process::ProcVM, sched::current::current_task};
 use alloc::boxed::Box;
 use libkernel::{
     PageInfo, UserAddressSpace,

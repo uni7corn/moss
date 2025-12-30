@@ -6,10 +6,10 @@ use libkernel::{
     },
 };
 
-use crate::{process::fd_table::Fd, sched::current_task};
+use crate::{process::fd_table::Fd, sched::current::current_task_shared};
 
 pub async fn sys_fchown(fd: Fd, owner: i32, group: i32) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
     let file = task
         .fd_table
         .lock_save_irq()

@@ -69,7 +69,7 @@ use crate::{
         },
         threading::{futex::sys_futex, sys_set_robust_list, sys_set_tid_address},
     },
-    sched::{current_task, sys_sched_yield},
+    sched::{current::current_task, sys_sched_yield},
 };
 use alloc::boxed::Box;
 use libkernel::{
@@ -78,10 +78,10 @@ use libkernel::{
 };
 
 pub async fn handle_syscall() {
-    let task = current_task();
-
     let (nr, arg1, arg2, arg3, arg4, arg5, arg6) = {
-        let ctx = task.ctx.lock_save_irq();
+        let mut task = current_task();
+
+        let ctx = &mut task.ctx;
         let state = ctx.user();
 
         (
@@ -314,8 +314,8 @@ pub async fn handle_syscall() {
         }
         0x8b => {
             // Special case for sys_rt_sigreturn
-            task.ctx
-                .lock_save_irq()
+            current_task()
+                .ctx
                 .put_signal_work(Box::pin(ArchImpl::do_signal_return()));
 
             return;
@@ -449,7 +449,7 @@ pub async fn handle_syscall() {
         }
         _ => panic!(
             "Unhandled syscall 0x{nr:x}, PC: 0x{:x}",
-            current_task().ctx.lock_save_irq().user().elr_el1
+            current_task().ctx.user().elr_el1
         ),
     };
 
@@ -458,5 +458,5 @@ pub async fn handle_syscall() {
         Err(e) => kern_err_to_syscall(e),
     };
 
-    task.ctx.lock_save_irq().user_mut().x[0] = ret_val.cast_unsigned() as u64;
+    current_task().ctx.user_mut().x[0] = ret_val.cast_unsigned() as u64;
 }

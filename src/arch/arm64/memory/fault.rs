@@ -9,7 +9,7 @@ use crate::{
         memory::uaccess::UAccessResult,
     },
     memory::fault::{FaultResolution, handle_demand_fault, handle_protection_fault},
-    sched::{current_task, spawn_kernel_work},
+    sched::{current::current_task, spawn_kernel_work},
 };
 use alloc::boxed::Box;
 use libkernel::{
@@ -111,7 +111,7 @@ pub fn handle_mem_fault(exception: Exception, info: AbortIss) {
             "SIGSEGV on process {} {:?} PC: {:x}",
             current_task().process.tgid,
             exception,
-            current_task().ctx.lock_save_irq().user().elr_el1
+            current_task().ctx.user().elr_el1
         ),
         // If the page fault involves sleepy kernel work, we can
         // spawn that work on the process, since there is no other

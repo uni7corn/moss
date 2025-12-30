@@ -263,20 +263,6 @@ pub fn schedule_preempt(when: Instant) {
     }
 }
 
-pub fn schedule_force_preempt() {
-    // Schedule a preemption event if none are scheduled
-    let when = now().unwrap() + Duration::from_millis(5);
-
-    if let Some(next_event) = WAKEUP_Q.borrow().peek()
-        && next_event.when <= when
-    {
-        // An event is already scheduled before our forced preemption
-        return;
-    }
-
-    schedule_preempt(when);
-}
-
 static SYS_TIMER: OnceLock<Arc<SysTimer>> = OnceLock::new();
 
 per_cpu! {

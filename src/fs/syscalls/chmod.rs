@@ -4,10 +4,10 @@ use libkernel::{
     fs::attr::FilePermissions,
 };
 
-use crate::{process::fd_table::Fd, sched::current_task};
+use crate::{process::fd_table::Fd, sched::current::current_task_shared};
 
 pub async fn sys_fchmod(fd: Fd, mode: u16) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
     let file = task
         .fd_table
         .lock_save_irq()

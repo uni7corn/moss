@@ -1,7 +1,7 @@
 use crate::{
     memory::uaccess::{UserCopyable, copy_obj_array_from_user},
     process::fd_table::Fd,
-    sched::current_task,
+    sched::current::current_task,
 };
 use libkernel::{
     error::{KernelError, Result},

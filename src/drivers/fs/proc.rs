@@ -2,7 +2,7 @@
 
 use crate::process::find_task_by_descriptor;
 use crate::process::thread_group::Tgid;
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use crate::sync::OnceLock;
 use crate::{
     drivers::{Driver, FilesystemDriver},

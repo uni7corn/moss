@@ -1,7 +1,7 @@
 use crate::{
     arch::{ArchImpl, arm64::exceptions::ExceptionState},
     memory::{PageOffsetTranslator, page::ClaimedPage},
-    process::Task,
+    process::owned::OwnedTask,
 };
 use core::arch::global_asm;
 use libkernel::{
@@ -16,7 +16,7 @@ use libkernel::{
 
 global_asm!(include_str!("idle.s"));
 
-pub fn create_idle_task() -> Task {
+pub fn create_idle_task() -> OwnedTask {
     let code_page = ClaimedPage::alloc_zeroed().unwrap().leak();
     let code_addr = VA::from_value(0xd00d0000);
 
@@ -60,5 +60,5 @@ pub fn create_idle_task() -> Task {
         VMAPermissions::rx(),
     );
 
-    Task::create_idle_task(addr_space, ctx, code_map)
+    OwnedTask::create_idle_task(addr_space, ctx, code_map)
 }

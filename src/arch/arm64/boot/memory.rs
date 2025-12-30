@@ -21,7 +21,7 @@ use libkernel::{
 };
 use log::info;
 
-const KERNEL_STACK_SZ: usize = 64 * 1024; // 32 KiB
+const KERNEL_STACK_SZ: usize = 256 * 1024; // 32 KiB
 pub const KERNEL_STACK_PG_ORDER: usize = (KERNEL_STACK_SZ / PAGE_SIZE).ilog2() as usize;
 
 const KERNEL_HEAP_SZ: usize = 64 * 1024 * 1024; // 64 MiB

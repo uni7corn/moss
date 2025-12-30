@@ -1,4 +1,4 @@
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use libkernel::{
     error::{KernelError, Result},
     fs::OpenFlags,

@@ -1,5 +1,5 @@
 use crate::memory::uaccess::{copy_from_user, copy_to_user};
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use libkernel::error::{KernelError, Result};
 use libkernel::memory::address::TUA;
 
@@ -26,9 +26,8 @@ pub async fn sys_rt_sigprocmask(
     };
 
     let old_sigmask = {
-        let task = current_task();
-        let mut sigmask = task.sig_mask.lock_save_irq();
-        let old_sigmask = *sigmask;
+        let mut task = current_task();
+        let old_sigmask = task.sig_mask;
 
         if let Some(set) = set {
             let mut new_sigmask = match how {
@@ -41,7 +40,7 @@ pub async fn sys_rt_sigprocmask(
             // SIGSTOP and SIGKILL can never be masked.
             new_sigmask = new_sigmask.union(UNMASKABLE_SIGNALS);
 
-            *sigmask = new_sigmask;
+            task.sig_mask = new_sigmask;
         }
 
         old_sigmask

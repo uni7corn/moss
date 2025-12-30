@@ -2,6 +2,7 @@
 #![no_main]
 #![feature(used_with_arg)]
 #![feature(likely_unlikely)]
+#![feature(box_as_ptr)]
 
 use alloc::{
     boxed::Box,
@@ -27,7 +28,9 @@ use libkernel::{
 };
 use log::{error, warn};
 use process::ctx::UserCtx;
-use sched::{current_task, sched_init, spawn_kernel_work, uspc_ret::dispatch_userspace_task};
+use sched::{
+    current::current_task_shared, sched_init, spawn_kernel_work, uspc_ret::dispatch_userspace_task,
+};
 
 extern crate alloc;
 
@@ -122,7 +125,7 @@ async fn launch_init(opts: KOptions) {
         .await
         .expect("Unable to find init");
 
-    let task = current_task();
+    let task = current_task_shared();
 
     // Ensure that the exec() call applies to init.
     assert!(task.process.tgid.is_init());
@@ -138,7 +141,7 @@ async fn launch_init(opts: KOptions) {
             OpenFlags::O_RDWR,
             VFS.root_inode(),
             FilePermissions::empty(),
-            task.clone(),
+            &task,
         )
         .await
         .expect("Could not open console for init process");
@@ -157,6 +160,8 @@ async fn launch_init(opts: KOptions) {
             .insert(console.clone())
             .expect("Could not clone FD");
     }
+
+    drop(task);
 
     process::exec::kernel_exec(inode, vec![init.as_str().to_string()], vec![])
         .await

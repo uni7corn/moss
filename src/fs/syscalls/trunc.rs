@@ -1,6 +1,11 @@
 use core::ffi::c_char;
 
-use crate::{fs::VFS, memory::uaccess::cstr::UserCStr, process::fd_table::Fd, sched::current_task};
+use crate::{
+    fs::VFS,
+    memory::uaccess::cstr::UserCStr,
+    process::fd_table::Fd,
+    sched::current::{current_task, current_task_shared},
+};
 use libkernel::{
     error::{KernelError, Result},
     fs::{OpenFlags, attr::FilePermissions, path::Path},
@@ -10,7 +15,7 @@ use libkernel::{
 pub async fn sys_truncate(path: TUA<c_char>, new_size: usize) -> Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
 
     let root = task.root.lock_save_irq().0.clone();
@@ -20,7 +25,7 @@ pub async fn sys_truncate(path: TUA<c_char>, new_size: usize) -> Result<usize> {
             OpenFlags::O_WRONLY,
             root,
             FilePermissions::empty(),
-            task,
+            &task,
         )
         .await?;
 

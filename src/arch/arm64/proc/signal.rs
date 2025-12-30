@@ -4,7 +4,7 @@ use crate::{
     process::thread_group::signal::{
         SigId, ksigaction::UserspaceSigAction, sigaction::SigActionFlags,
     },
-    sched::current_task,
+    sched::current::current_task,
 };
 use libkernel::{
     error::Result,
@@ -29,7 +29,7 @@ pub async fn do_signal(id: SigId, sa: UserspaceSigAction) -> Result<ExceptionSta
     let task = current_task();
     let mut signal = task.process.signals.lock_save_irq();
 
-    let saved_state = *task.ctx.lock_save_irq().user();
+    let saved_state = *task.ctx.user();
     let mut new_state = saved_state;
     let mut frame = RtSigFrame {
         uctx: saved_state,
@@ -65,8 +65,7 @@ pub async fn do_signal(id: SigId, sa: UserspaceSigAction) -> Result<ExceptionSta
 pub async fn do_signal_return() -> Result<ExceptionState> {
     let task = current_task();
 
-    let sig_frame_addr: TUA<RtSigFrame> =
-        TUA::from_value(task.ctx.lock_save_irq().user().sp_el0 as _);
+    let sig_frame_addr: TUA<RtSigFrame> = TUA::from_value(task.ctx.user().sp_el0 as _);
 
     let sig_frame = copy_from_user(sig_frame_addr).await?;
 

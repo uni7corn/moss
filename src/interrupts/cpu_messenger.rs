@@ -3,7 +3,7 @@
 use super::{
     ClaimedInterrupt, InterruptConfig, InterruptDescriptor, InterruptHandler, get_interrupt_root,
 };
-use crate::process::Task;
+use crate::process::owned::OwnedTask;
 use crate::{
     arch::ArchImpl,
     drivers::Driver,
@@ -11,6 +11,7 @@ use crate::{
     sched,
     sync::{OnceLock, SpinLock},
 };
+use alloc::boxed::Box;
 use alloc::{sync::Arc, vec::Vec};
 use libkernel::{
     CpuOps,
@@ -18,9 +19,8 @@ use libkernel::{
 };
 use log::{info, warn};
 
-#[derive(Clone)]
 pub enum Message {
-    PutTask(Arc<Task>),
+    PutTask(Box<OwnedTask>),
     Ping(u32),
 }
 

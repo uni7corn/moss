@@ -21,6 +21,7 @@ use memory::{
 use crate::{
     process::{
         Task,
+        owned::OwnedTask,
         thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
     },
     sync::SpinLock,
@@ -37,6 +38,7 @@ mod proc;
 pub mod psci;
 
 pub struct Aarch64 {}
+
 impl CpuOps for Aarch64 {
     fn id() -> usize {
         MPIDR_EL1.read(MPIDR_EL1::Aff0) as _
@@ -109,7 +111,7 @@ impl Arch for Aarch64 {
         proc::context_switch(new);
     }
 
-    fn create_idle_task() -> Task {
+    fn create_idle_task() -> OwnedTask {
         proc::idle::create_idle_task()
     }
 

@@ -6,7 +6,7 @@ use crate::{
     arch::ArchImpl,
     interrupts::get_interrupt_root,
     ksym_pa,
-    sched::{current_task, uspc_ret::dispatch_userspace_task},
+    sched::{current::current_task, uspc_ret::dispatch_userspace_task},
     spawn_kernel_work,
 };
 use aarch64_cpu::registers::{CPACR_EL1, ReadWriteable, VBAR_EL1};
@@ -144,7 +144,7 @@ extern "C" fn el1_serror_spx(state: &mut ExceptionState) {
 
 #[unsafe(no_mangle)]
 extern "C" fn el0_sync(state_ptr: *mut ExceptionState) -> *const ExceptionState {
-    current_task().ctx.lock_save_irq().save_user_ctx(state_ptr);
+    current_task().ctx.save_user_ctx(state_ptr);
 
     let state = unsafe { state_ptr.as_ref().unwrap() };
 
@@ -174,7 +174,7 @@ extern "C" fn el0_sync(state_ptr: *mut ExceptionState) -> *const ExceptionState 
 
 #[unsafe(no_mangle)]
 extern "C" fn el0_irq(state: *mut ExceptionState) -> *mut ExceptionState {
-    current_task().ctx.lock_save_irq().save_user_ctx(state);
+    current_task().ctx.save_user_ctx(state);
 
     match get_interrupt_root() {
         Some(ref im) => im.handle_interrupt(),

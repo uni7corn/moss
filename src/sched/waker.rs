@@ -1,6 +1,8 @@
 use crate::process::{TASK_LIST, TaskDescriptor, TaskState};
 use core::task::{RawWaker, RawWakerVTable, Waker};
 
+use super::SCHED_STATE;
+
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     RawWaker::new(data, &VTABLE)
 }
@@ -17,6 +19,8 @@ unsafe fn wake_waker(data: *const ()) {
             // If the task has been put to sleep, then wake it up.
             TaskState::Sleeping => {
                 *state = TaskState::Runnable;
+
+                SCHED_STATE.borrow_mut().wakeup(desc);
             }
             // If the task is running, mark it so it doesn't actually go to
             // sleep when poll returns. This covers the small race-window

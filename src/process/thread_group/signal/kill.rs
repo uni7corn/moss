@@ -3,7 +3,7 @@ use crate::{
         Tid,
         thread_group::{Pgid, Tgid, ThreadGroup, pid::PidT},
     },
-    sched::current_task,
+    sched::current::current_task,
 };
 
 use super::{SigId, uaccess::UserSigId};

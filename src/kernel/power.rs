@@ -1,11 +1,11 @@
-use crate::{ArchImpl, arch::Arch, sched::current_task};
+use crate::{ArchImpl, arch::Arch, sched::current::current_task_shared};
 use libkernel::{
     error::{KernelError, Result},
     proc::caps::CapabilitiesFlags,
 };
 
 pub async fn sys_reboot(magic: u32, magic2: u32, op: u32, _arg: usize) -> Result<usize> {
-    current_task()
+    current_task_shared()
         .creds
         .lock_save_irq()
         .caps()

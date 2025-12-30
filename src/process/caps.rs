@@ -1,9 +1,9 @@
 use crate::{
-    current_task,
     memory::uaccess::{
         UserCopyable, copy_from_user, copy_obj_array_from_user, copy_objs_to_user, copy_to_user,
     },
     process::TASK_LIST,
+    sched::current::current_task_shared,
 };
 use libkernel::{
     error::{KernelError, Result},
@@ -53,7 +53,7 @@ pub async fn sys_capget(hdrp: TUA<CapUserHeader>, datap: TUA<CapUserData>) -> Re
     let mut header = copy_from_user(hdrp).await?;
 
     let task = if header.pid == 0 {
-        current_task()
+        current_task_shared()
     } else {
         TASK_LIST
             .lock_save_irq()
@@ -85,9 +85,9 @@ pub async fn sys_capget(hdrp: TUA<CapUserHeader>, datap: TUA<CapUserData>) -> Re
 pub async fn sys_capset(hdrp: TUA<CapUserHeader>, datap: TUA<CapUserData>) -> Result<usize> {
     let mut header = copy_from_user(hdrp).await?;
 
-    let caller_caps = current_task().creds.lock_save_irq().caps();
+    let caller_caps = current_task_shared().creds.lock_save_irq().caps();
     let task = if header.pid == 0 {
-        current_task()
+        current_task_shared()
     } else {
         caller_caps.check_capable(CapabilitiesFlags::CAP_SETPCAP)?;
         TASK_LIST

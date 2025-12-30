@@ -1,6 +1,6 @@
 use libkernel::error::{KernelError, Result};
 
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use core::convert::Infallible;
 
 use super::{Pgid, Tgid, ThreadGroup};

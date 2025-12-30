@@ -3,7 +3,7 @@ use crate::{
     kernel::kpipe::KPipe,
     memory::uaccess::{copy_from_user, copy_from_user_slice, copy_to_user},
     process::thread_group::Pgid,
-    sched::current_task,
+    sched::current::current_task,
     sync::SpinLock,
 };
 use alloc::{boxed::Box, sync::Arc};

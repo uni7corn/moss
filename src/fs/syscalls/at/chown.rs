@@ -14,7 +14,7 @@ use crate::{
     fs::syscalls::at::{AtFlags, resolve_at_start_node, resolve_path_flags},
     memory::uaccess::cstr::UserCStr,
     process::fd_table::Fd,
-    sched::current_task,
+    sched::current::current_task_shared,
 };
 
 pub async fn sys_fchownat(
@@ -26,12 +26,12 @@ pub async fn sys_fchownat(
 ) -> Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let flags = AtFlags::from_bits_retain(flags);
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
     let start_node = resolve_at_start_node(dirfd, path, flags).await?;
 
-    let node = resolve_path_flags(dirfd, path, start_node, task.clone(), flags).await?;
+    let node = resolve_path_flags(dirfd, path, start_node, &task, flags).await?;
     let mut attr = node.getattr().await?;
 
     {

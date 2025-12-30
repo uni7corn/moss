@@ -1,21 +1,22 @@
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
+use crate::{
+    drivers::{DM, Driver},
+    process::Task,
+    sync::SpinLock,
+};
+use alloc::{borrow::ToOwned, boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 use async_trait::async_trait;
 use core::sync::atomic::{AtomicU64, Ordering};
 use dir::DirFile;
-use libkernel::error::{FsError, KernelError, Result};
-use libkernel::fs::attr::FilePermissions;
-use libkernel::fs::path::Path;
-use libkernel::fs::{BlockDevice, FS_ID_START, FileType, Filesystem, Inode, InodeId, OpenFlags};
-use libkernel::proc::caps::CapabilitiesFlags;
+use libkernel::{
+    error::{FsError, KernelError, Result},
+    fs::{
+        BlockDevice, FS_ID_START, FileType, Filesystem, Inode, InodeId, OpenFlags,
+        attr::FilePermissions, path::Path,
+    },
+    proc::caps::CapabilitiesFlags,
+};
 use open_file::OpenFile;
 use reg::RegFile;
-
-use crate::drivers::{DM, Driver};
-use crate::process::Task;
-use crate::sync::SpinLock;
-use alloc::vec::Vec;
 
 pub mod dir;
 pub mod fops;
@@ -182,7 +183,7 @@ impl VFS {
         &self,
         path: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<dyn Inode>> {
         let root = if path.is_absolute() {
             task.root.lock_save_irq().0.clone() // use the task's root inode, in case a custom chroot was set
@@ -199,7 +200,7 @@ impl VFS {
         &self,
         path: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<dyn Inode>> {
         let root = if path.is_absolute() {
             task.root.lock_save_irq().0.clone()
@@ -306,10 +307,10 @@ impl VFS {
         flags: OpenFlags,
         root: Arc<dyn Inode>,
         mode: FilePermissions,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<OpenFile>> {
         // Attempt to resolve the full path first.
-        let resolve_result = self.resolve_path(path, root.clone(), task.clone()).await;
+        let resolve_result = self.resolve_path(path, root.clone(), task).await;
 
         let target_inode = match resolve_result {
             // The file/directory exists.
@@ -413,10 +414,10 @@ impl VFS {
         path: &Path,
         root: Arc<dyn Inode>,
         mode: FilePermissions,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
         // Try to resolve the target directory first.
-        match self.resolve_path(path, root.clone(), task.clone()).await {
+        match self.resolve_path(path, root.clone(), task).await {
             // The path already exists, this is an error.
             Ok(_) => Err(FsError::AlreadyExists.into()),
 
@@ -457,12 +458,10 @@ impl VFS {
         path: &Path,
         root: Arc<dyn Inode>,
         remove_dir: bool,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
         // First, resolve the target inode so we can inspect its type.
-        let target_inode = self
-            .resolve_path_nofollow(path, root.clone(), task.clone())
-            .await?;
+        let target_inode = self.resolve_path_nofollow(path, root.clone(), task).await?;
 
         let attr = target_inode.getattr().await?;
 
@@ -480,8 +479,7 @@ impl VFS {
 
         // Determine the parent directory inode in which to perform the unlink.
         let parent_inode = if let Some(parent_path) = path.parent() {
-            self.resolve_path(parent_path, root.clone(), task.clone())
-                .await?
+            self.resolve_path(parent_path, root.clone(), task).await?
         } else {
             root.clone()
         };
@@ -527,9 +525,9 @@ impl VFS {
         target: &Path,
         link: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
-        match self.resolve_path(link, root.clone(), task.clone()).await {
+        match self.resolve_path(link, root.clone(), task).await {
             Ok(_) => Err(FsError::AlreadyExists.into()),
             Err(KernelError::Fs(FsError::NotFound)) => {
                 let name = link.file_name().ok_or(FsError::InvalidInput)?;

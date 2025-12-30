@@ -1,4 +1,4 @@
-use crate::{kernel::kpipe::KPipe, process::fd_table::Fd, sched::current_task};
+use crate::{kernel::kpipe::KPipe, process::fd_table::Fd, sched::current::current_task};
 use alloc::sync::Arc;
 use libkernel::{
     error::{KernelError, Result},

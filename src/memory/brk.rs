@@ -2,7 +2,7 @@ use core::convert::Infallible;
 
 use libkernel::memory::address::VA;
 
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 
 /// Handles the `brk` system call.
 ///
