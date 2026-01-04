@@ -1,39 +1,23 @@
-use crate::drivers::timer::Instant;
-use crate::process::threading::RobustListHead;
-use crate::{
-    arch::{Arch, ArchImpl},
-    fs::DummyInode,
-    sync::SpinLock,
-};
+use crate::{arch::ArchImpl, kernel::cpu_id::CpuId, sync::SpinLock};
 use alloc::{
     collections::btree_map::BTreeMap,
     sync::{Arc, Weak},
 };
 use core::fmt::Display;
 use creds::Credentials;
-use ctx::{Context, UserCtx};
 use fd_table::FileDescriptorTable;
-use libkernel::memory::address::TUA;
 use libkernel::{VirtualMemory, fs::Inode};
-use libkernel::{
-    fs::pathbuf::PathBuf,
-    memory::{
-        address::VA,
-        proc_vm::{ProcessVM, vmarea::VMArea},
-    },
-};
-use thread_group::{
-    Tgid, ThreadGroup,
-    builder::ThreadGroupBuilder,
-    signal::{SigId, SigSet, SignalState},
-};
+use libkernel::{fs::pathbuf::PathBuf, memory::proc_vm::ProcessVM};
+use thread_group::{Tgid, ThreadGroup};
 
+pub mod caps;
 pub mod clone;
 pub mod creds;
 pub mod ctx;
 pub mod exec;
 pub mod exit;
 pub mod fd_table;
+pub mod owned;
 pub mod sleep;
 pub mod thread_group;
 pub mod threading;
@@ -49,6 +33,10 @@ impl Tid {
 
     pub fn from_tgid(tgid: Tgid) -> Self {
         Self(tgid.0)
+    }
+
+    fn idle_for_cpu() -> Tid {
+        Self(CpuId::this().value() as _)
     }
 }
 
@@ -68,7 +56,7 @@ impl TaskDescriptor {
     pub fn this_cpus_idle() -> Self {
         Self {
             tgid: Tgid(0),
-            tid: Tid(0),
+            tid: Tid(CpuId::this().value() as _),
         }
     }
 
@@ -173,92 +161,13 @@ pub struct Task {
     pub root: Arc<SpinLock<(Arc<dyn Inode>, PathBuf)>>,
     pub creds: SpinLock<Credentials>,
     pub fd_table: Arc<SpinLock<FileDescriptorTable>>,
-    pub ctx: SpinLock<Context>,
-    pub sig_mask: SpinLock<SigSet>,
-    pub pending_signals: SpinLock<SigSet>,
-    pub vruntime: SpinLock<u64>,
-    pub exec_start: SpinLock<Option<Instant>>,
-    pub deadline: SpinLock<Option<Instant>>,
-    pub priority: i8,
-    pub last_run: SpinLock<Option<Instant>>,
     pub state: Arc<SpinLock<TaskState>>,
-    pub robust_list: SpinLock<Option<TUA<RobustListHead>>>,
-    pub child_tid_ptr: SpinLock<Option<TUA<u32>>>,
+    pub last_cpu: SpinLock<CpuId>,
 }
 
 impl Task {
-    pub fn create_idle_task(
-        addr_space: <ArchImpl as VirtualMemory>::ProcessAddressSpace,
-        user_ctx: UserCtx,
-        code_map: VMArea,
-    ) -> Self {
-        // SAFETY: The code page will have been mapped corresponding to the VMA.
-        let vm = unsafe { ProcessVM::from_vma_and_address_space(code_map, addr_space) };
-
-        let thread_group_builder = ThreadGroupBuilder::new(Tgid::idle())
-            .with_sigstate(Arc::new(SpinLock::new(SignalState::new_ignore())));
-
-        Self {
-            tid: Tid(0),
-            comm: Arc::new(SpinLock::new(Comm::new("idle"))),
-            process: thread_group_builder.build(),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            priority: i8::MIN,
-            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            creds: SpinLock::new(Credentials::new_root()),
-            ctx: SpinLock::new(Context::from_user_ctx(user_ctx)),
-            vm: Arc::new(SpinLock::new(vm)),
-            sig_mask: SpinLock::new(SigSet::empty()),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(None),
-            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(None),
-        }
-    }
-
-    pub fn create_init_task() -> Self {
-        Self {
-            tid: Tid(1),
-            comm: Arc::new(SpinLock::new(Comm::new("init"))),
-            process: ThreadGroupBuilder::new(Tgid::init()).build(),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            creds: SpinLock::new(Credentials::new_root()),
-            vm: Arc::new(SpinLock::new(
-                ProcessVM::empty().expect("Could not create init process's VM"),
-            )),
-            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(None),
-            sig_mask: SpinLock::new(SigSet::empty()),
-            priority: 0,
-            ctx: SpinLock::new(Context::from_user_ctx(
-                <ArchImpl as Arch>::new_user_context(VA::null(), VA::null()),
-            )),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(None),
-        }
-    }
-
     pub fn is_idle_task(&self) -> bool {
         self.process.tgid.is_idle()
-    }
-
-    pub fn priority(&self) -> i8 {
-        self.priority
-    }
-
-    pub fn set_priority(&mut self, priority: i8) {
-        self.priority = priority;
     }
 
     pub fn pgid(&self) -> Tgid {
@@ -274,13 +183,16 @@ impl Task {
     pub fn descriptor(&self) -> TaskDescriptor {
         TaskDescriptor::from_tgid_tid(self.process.tgid, self.tid)
     }
-
-    pub fn raise_task_signal(&self, signal: SigId) {
-        self.pending_signals.lock_save_irq().insert(signal.into());
-    }
 }
 
-pub static TASK_LIST: SpinLock<BTreeMap<TaskDescriptor, Weak<SpinLock<TaskState>>>> =
+pub fn find_task_by_descriptor(descriptor: &TaskDescriptor) -> Option<Arc<Task>> {
+    TASK_LIST
+        .lock_save_irq()
+        .get(descriptor)
+        .and_then(|x| x.upgrade())
+}
+
+pub static TASK_LIST: SpinLock<BTreeMap<TaskDescriptor, Weak<Task>>> =
     SpinLock::new(BTreeMap::new());
 
 unsafe impl Send for Task {}

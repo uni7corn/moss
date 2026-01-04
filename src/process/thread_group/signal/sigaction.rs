@@ -3,7 +3,7 @@ use libkernel::error::{KernelError, Result};
 use libkernel::memory::address::TUA;
 
 use crate::memory::uaccess::{UserCopyable, copy_from_user, copy_to_user};
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 
 use super::ksigaction::UserspaceSigAction;
 use super::uaccess::UserSigId;
@@ -93,8 +93,6 @@ pub async fn sys_rt_sigaction(
     oact: TUA<UserSigAction>,
     sigsetsize: usize,
 ) -> Result<usize> {
-    let task = current_task();
-
     if sigsetsize != size_of::<SigSet>() {
         Err(KernelError::InvalidValue)?
     }
@@ -112,6 +110,8 @@ pub async fn sys_rt_sigaction(
     };
 
     let old_action = {
+        let task = current_task();
+
         let sigstate = task.process.signals.lock_save_irq();
         let mut action_table = sigstate.action.lock_save_irq();
         let old_action = action_table[sig];

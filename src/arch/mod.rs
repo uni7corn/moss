@@ -10,6 +10,7 @@
 
 use crate::process::{
     Task,
+    owned::OwnedTask,
     thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
 };
 use alloc::sync::Arc;
@@ -27,6 +28,8 @@ pub trait Arch: CpuOps + VirtualMemory {
 
     fn name() -> &'static str;
 
+    fn cpu_count() -> usize;
+
     /// Prepares the initial context for a new user-space thread. This sets up
     /// the stack frame so that when we context-switch to it, it will begin
     /// execution at the specified `entry_point`.
@@ -37,7 +40,7 @@ pub trait Arch: CpuOps + VirtualMemory {
     fn context_switch(new: Arc<Task>);
 
     /// Construct a new idle task.
-    fn create_idle_task() -> Task;
+    fn create_idle_task() -> OwnedTask;
 
     /// Powers off the machine. Implementations must never return.
     fn power_off() -> !;

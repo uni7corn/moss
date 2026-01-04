@@ -1,6 +1,6 @@
 use core::convert::Infallible;
 
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 
 pub fn sys_umask(new_umask: u32) -> core::result::Result<usize, Infallible> {
     let task = current_task();

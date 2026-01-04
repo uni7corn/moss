@@ -1,13 +1,15 @@
+use crate::ArchImpl;
 use crate::process::Comm;
+use crate::sched::current::current_task_shared;
 use crate::{
-    arch::{Arch, ArchImpl},
+    arch::Arch,
     fs::VFS,
     memory::{
         page::ClaimedPage,
         uaccess::{copy_from_user, cstr::UserCStr},
     },
-    process::{TaskState, ctx::Context, thread_group::signal::SignalState},
-    sched::current_task,
+    process::{ctx::Context, thread_group::signal::SignalState},
+    sched::current::current_task,
 };
 use alloc::{string::String, vec};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
@@ -119,13 +121,13 @@ pub async fn kernel_exec(
 
     let new_comm = argv.first().map(|s| Comm::new(s.as_str()));
 
-    let current_task = current_task();
+    let mut current_task = current_task();
 
     if let Some(new_comm) = new_comm {
         *current_task.comm.lock_save_irq() = new_comm;
     }
-    *current_task.ctx.lock_save_irq() = Context::from_user_ctx(user_ctx);
-    *current_task.state.lock_save_irq() = TaskState::Runnable;
+
+    current_task.ctx = Context::from_user_ctx(user_ctx);
     *current_task.vm.lock_save_irq() = vm;
     *current_task.process.signals.lock_save_irq() = SignalState::new_default();
 
@@ -248,6 +250,7 @@ pub async fn sys_execve(
     mut usr_argv: TUA<TUA<c_char>>,
     mut usr_env: TUA<TUA<c_char>>,
 ) -> Result<usize> {
+    let task = current_task_shared();
     let mut buf = [0; 1024];
     let mut argv = Vec::new();
     let mut envp = Vec::new();
@@ -276,11 +279,8 @@ pub async fn sys_execve(
         usr_env = usr_env.add_objs(1);
     }
 
-    let task = current_task();
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
-    let inode = VFS
-        .resolve_path(path, VFS.root_inode(), task.clone())
-        .await?;
+    let inode = VFS.resolve_path(path, VFS.root_inode(), &task).await?;
 
     kernel_exec(inode, argv, envp).await?;
 

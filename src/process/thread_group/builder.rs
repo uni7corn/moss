@@ -1,4 +1,4 @@
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64};
 
 use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 
@@ -16,6 +16,7 @@ pub struct ThreadGroupBuilder {
     tgid: Tgid,
     parent: Option<Arc<ThreadGroup>>,
     umask: Option<u32>,
+    pri: Option<i8>,
     sigstate: Option<Arc<SpinLock<SignalState>>>,
     rsrc_lim: Option<Arc<SpinLock<ResourceLimits>>>,
 }
@@ -29,6 +30,7 @@ impl ThreadGroupBuilder {
             umask: None,
             sigstate: None,
             rsrc_lim: None,
+            pri: None,
         }
     }
 
@@ -46,6 +48,11 @@ impl ThreadGroupBuilder {
 
     pub fn with_rsrc_lim(mut self, rsrc_lim: Arc<SpinLock<ResourceLimits>>) -> Self {
         self.rsrc_lim = Some(rsrc_lim);
+        self
+    }
+
+    pub fn with_priority(mut self, priority: i8) -> Self {
+        self.pri = Some(priority);
         self
     }
 
@@ -68,12 +75,15 @@ impl ThreadGroupBuilder {
                 .unwrap_or_else(|| Arc::new(SpinLock::new(ResourceLimits::default()))),
             pending_signals: SpinLock::new(SigSet::empty()),
             child_notifiers: ChildNotifiers::new(),
+            priority: SpinLock::new(self.pri.unwrap_or(0)),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
             // Don't start from '0'. Since clone expects the parent to return
             // the tid and the child to return '0', if we started from '0' we
             // couldn't then differentiate between a child and a parent.
             next_tid: AtomicU32::new(1),
             state: SpinLock::new(ProcessState::Running),
-            threads: SpinLock::new(BTreeMap::new()),
+            tasks: SpinLock::new(BTreeMap::new()),
         });
 
         TG_LIST

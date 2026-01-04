@@ -12,7 +12,7 @@ use crate::{
         UserCopyable, copy_from_user, copy_obj_array_from_user, copy_objs_to_user, copy_to_user,
     },
     process::thread_group::signal::SigSet,
-    sched::current_task,
+    sched::current::current_task_shared,
 };
 
 use super::Fd;
@@ -68,7 +68,7 @@ pub async fn sys_pselect6(
     timeout: TUA<TimeSpec>,
     _mask: TUA<SigSet>,
 ) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     let mut read_fd_set = copy_from_user(readfds).await?;
 
@@ -168,7 +168,7 @@ pub async fn sys_ppoll(
     _sigmask: TUA<SigSet>,
     _sigset_len: usize,
 ) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     let mut poll_fds = copy_obj_array_from_user(ufds, nfds as _).await?;
 

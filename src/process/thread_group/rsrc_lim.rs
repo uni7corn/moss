@@ -6,7 +6,7 @@ use libkernel::{
 use crate::{
     memory::uaccess::{UserCopyable, copy_from_user, copy_to_user},
     process::thread_group::{TG_LIST, Tgid},
-    sched::current_task,
+    sched::current::current_task,
 };
 
 use super::pid::PidT;

@@ -1,6 +1,6 @@
 use crate::clock::timespec::TimeSpec;
 use crate::memory::uaccess::copy_to_user;
-use crate::sched::current_task;
+use crate::sched::current::current_task_shared;
 use crate::sync::CondVar;
 use alloc::collections::btree_map::BTreeMap;
 use bitflags::Flags;
@@ -137,7 +137,7 @@ pub async fn sys_wait4(
         return Err(KernelError::NotSupported);
     }
 
-    let task = current_task();
+    let task = current_task_shared();
 
     let (tgid, child_state) = task
         .process

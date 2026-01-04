@@ -3,7 +3,7 @@ use crate::{
         Tid,
         thread_group::{Pgid, Tgid, ThreadGroup, pid::PidT},
     },
-    sched::current_task,
+    sched::current::current_task,
 };
 
 use super::{SigId, uaccess::UserSigId};
@@ -82,7 +82,7 @@ pub fn sys_tkill(tid: PidT, signal: UserSigId) -> Result<usize> {
     } else {
         let task = current_task
             .process
-            .threads
+            .tasks
             .lock_save_irq()
             .get(&target_tid)
             .and_then(|t| t.upgrade())

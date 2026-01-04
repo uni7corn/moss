@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{process::fd_table::Fd, sched::current_task};
+use crate::{process::fd_table::Fd, sched::current::current_task};
 use libkernel::{
     error::{KernelError, Result},
     memory::{

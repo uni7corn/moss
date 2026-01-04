@@ -2,6 +2,7 @@ use core::mem;
 
 use crate::{
     arch::arm64::{
+        boot::memory::KERNEL_STACK_AREA,
         exceptions::{
             ExceptionState,
             esr::{AbortIss, Exception, IfscCategory},
@@ -9,7 +10,7 @@ use crate::{
         memory::uaccess::UAccessResult,
     },
     memory::fault::{FaultResolution, handle_demand_fault, handle_protection_fault},
-    sched::{current_task, spawn_kernel_work},
+    sched::{current::current_task, spawn_kernel_work},
 };
 use alloc::boxed::Box;
 use libkernel::{
@@ -100,7 +101,16 @@ pub fn handle_kernel_mem_fault(exception: Exception, info: AbortIss, state: &mut
     // If the source of the fault (ELR), wasn't in the uacess fixup section,
     // then any abort genereated by the kernel is a panic since we don't
     // demand-page any kernel memory.
-    panic!("Kernel memory fault detected.  Context: {}", state);
+    //
+    // Try and differentiate between a stack overflow condition and other
+    // faults.
+    if let Some(far) = info.far
+        && KERNEL_STACK_AREA.contains_address(VA::from_value(far as _))
+    {
+        panic!("Kernel stack overflow detected.  Context:\n{}", state);
+    } else {
+        panic!("Kernel memory fault detected.  Context:\n{}", state);
+    }
 }
 
 pub fn handle_mem_fault(exception: Exception, info: AbortIss) {
@@ -111,7 +121,7 @@ pub fn handle_mem_fault(exception: Exception, info: AbortIss) {
             "SIGSEGV on process {} {:?} PC: {:x}",
             current_task().process.tgid,
             exception,
-            current_task().ctx.lock_save_irq().user().elr_el1
+            current_task().ctx.user().elr_el1
         ),
         // If the page fault involves sleepy kernel work, we can
         // spawn that work on the process, since there is no other

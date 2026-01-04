@@ -4,6 +4,7 @@ use libkernel::{
     error::{FsError, KernelError, Result},
     fs::{FileType, path::Path},
     memory::address::TUA,
+    proc::caps::CapabilitiesFlags,
 };
 
 use crate::{
@@ -13,7 +14,7 @@ use crate::{
     },
     memory::uaccess::cstr::UserCStr,
     process::fd_table::Fd,
-    sched::current_task,
+    sched::current::current_task_shared,
 };
 
 pub async fn sys_linkat(
@@ -26,7 +27,7 @@ pub async fn sys_linkat(
     let mut buf = [0; 1024];
     let mut buf2 = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let mut flags = AtFlags::from_bits_retain(flags);
 
     // following symlinks is implied for any other syscall.
@@ -34,6 +35,16 @@ pub async fn sys_linkat(
     // linkat implicitly does not follow symlinks unless specified.
     if !flags.contains(AtFlags::AT_SYMLINK_FOLLOW) {
         flags.insert(AtFlags::AT_SYMLINK_NOFOLLOW);
+    }
+
+    if flags.contains(AtFlags::AT_EMPTY_PATH)
+        && !task
+            .creds
+            .lock_save_irq()
+            .caps()
+            .is_capable(CapabilitiesFlags::CAP_DAC_READ_SEARCH)
+    {
+        return Err(FsError::NotFound.into()); // weird error but thats what linkat(2) says
     }
 
     let old_path = Path::new(
@@ -46,17 +57,11 @@ pub async fn sys_linkat(
             .copy_from_user(&mut buf2)
             .await?,
     );
-    let old_start_node = resolve_at_start_node(old_dirfd, old_path).await?;
-    let new_start_node = resolve_at_start_node(new_dirfd, new_path).await?;
+    let old_start_node = resolve_at_start_node(old_dirfd, old_path, flags).await?;
+    let new_start_node = resolve_at_start_node(new_dirfd, new_path, flags).await?;
 
-    let target_inode = resolve_path_flags(
-        old_dirfd,
-        old_path,
-        old_start_node.clone(),
-        task.clone(),
-        flags,
-    )
-    .await?;
+    let target_inode =
+        resolve_path_flags(old_dirfd, old_path, old_start_node.clone(), &task, flags).await?;
 
     let attr = target_inode.getattr().await?;
 
@@ -66,7 +71,7 @@ pub async fn sys_linkat(
 
     // newpath does not follow flags, and doesnt follow symlinks either
     if VFS
-        .resolve_path_nofollow(new_path, new_start_node.clone(), task.clone())
+        .resolve_path_nofollow(new_path, new_start_node.clone(), &task)
         .await
         .is_ok()
     {
@@ -75,7 +80,7 @@ pub async fn sys_linkat(
 
     // parent newpath should follow symlinks though
     let parent_inode = if let Some(parent) = new_path.parent() {
-        VFS.resolve_path(parent, new_start_node, task).await?
+        VFS.resolve_path(parent, new_start_node, &task).await?
     } else {
         new_start_node
     };
