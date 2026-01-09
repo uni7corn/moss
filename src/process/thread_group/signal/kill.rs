@@ -18,16 +18,16 @@ pub fn sys_kill(pid: PidT, signal: UserSigId) -> Result<usize> {
     if pid == current_task.process.tgid.value() as PidT {
         current_task
             .process
-            .signals
+            .pending_signals
             .lock_save_irq()
-            .set_pending(signal);
+            .set_signal(signal);
         return Ok(0);
     }
 
     match pid {
         p if p > 0 => {
             let target_tg = ThreadGroup::get(Tgid(p as _)).ok_or(KernelError::NoProcess)?;
-            target_tg.signals.lock_save_irq().set_pending(signal);
+            target_tg.pending_signals.lock_save_irq().set_signal(signal);
         }
 
         0 => {
@@ -41,7 +41,7 @@ pub fn sys_kill(pid: PidT, signal: UserSigId) -> Result<usize> {
                 if let Some(tg) = tg_weak.upgrade()
                     && *tg.pgid.lock_save_irq() == our_pgid
                 {
-                    tg.signals.lock_save_irq().set_pending(signal);
+                    tg.pending_signals.lock_save_irq().set_signal(signal);
                 }
             }
         }
@@ -55,7 +55,7 @@ pub fn sys_kill(pid: PidT, signal: UserSigId) -> Result<usize> {
                 if let Some(tg) = tg_weak.upgrade()
                     && *tg.pgid.lock_save_irq() == target_pgid
                 {
-                    tg.signals.lock_save_irq().set_pending(signal);
+                    tg.pending_signals.lock_save_irq().set_signal(signal);
                 }
             }
         }
@@ -76,9 +76,9 @@ pub fn sys_tkill(tid: PidT, signal: UserSigId) -> Result<usize> {
     if current_task.tid == target_tid {
         current_task
             .process
-            .signals
+            .pending_signals
             .lock_save_irq()
-            .set_pending(signal);
+            .set_signal(signal);
     } else {
         let task = current_task
             .process
@@ -88,7 +88,10 @@ pub fn sys_tkill(tid: PidT, signal: UserSigId) -> Result<usize> {
             .and_then(|t| t.upgrade())
             .ok_or(KernelError::NoProcess)?;
 
-        task.process.signals.lock_save_irq().set_pending(signal);
+        task.process
+            .pending_signals
+            .lock_save_irq()
+            .set_signal(signal);
     }
 
     Ok(0)
@@ -99,7 +102,7 @@ pub fn send_signal_to_pg(pgid: Pgid, signal: SigId) {
         if let Some(tg) = tg_weak.upgrade()
             && *tg.pgid.lock_save_irq() == pgid
         {
-            tg.signals.lock_save_irq().set_pending(signal);
+            tg.pending_signals.lock_save_irq().set_signal(signal);
         }
     }
 }

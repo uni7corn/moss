@@ -80,7 +80,10 @@ pub fn do_exit_group(exit_code: ChildState) {
 
     parent.child_notifiers.child_update(process.tgid, exit_code);
 
-    parent.signals.lock_save_irq().set_pending(SigId::SIGCHLD);
+    parent
+        .pending_signals
+        .lock_save_irq()
+        .set_signal(SigId::SIGCHLD);
 
     // 5. This thread is now finished.
     *task.state.lock_save_irq() = TaskState::Finished;

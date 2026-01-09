@@ -12,7 +12,7 @@ use core::{
 };
 use pid::PidT;
 use rsrc_lim::ResourceLimits;
-use signal::{SigSet, SignalState};
+use signal::{SigSet, SignalActionState};
 use wait::ChildNotifiers;
 
 pub mod builder;
@@ -96,7 +96,7 @@ pub struct ThreadGroup {
     pub parent: SpinLock<Option<Weak<ThreadGroup>>>,
     pub children: SpinLock<BTreeMap<Tgid, Arc<ThreadGroup>>>,
     pub tasks: SpinLock<BTreeMap<Tid, Weak<Task>>>,
-    pub signals: Arc<SpinLock<SignalState>>,
+    pub signals: Arc<SpinLock<SignalActionState>>,
     pub rsrc_lim: Arc<SpinLock<ResourceLimits>>,
     pub pending_signals: SpinLock<SigSet>,
     pub priority: SpinLock<i8>,

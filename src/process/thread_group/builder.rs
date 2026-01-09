@@ -7,7 +7,7 @@ use crate::sync::SpinLock;
 use super::{
     Pgid, ProcessState, Sid, TG_LIST, Tgid, ThreadGroup,
     rsrc_lim::ResourceLimits,
-    signal::{SigSet, SignalState},
+    signal::{SigSet, SignalActionState},
     wait::ChildNotifiers,
 };
 
@@ -17,7 +17,7 @@ pub struct ThreadGroupBuilder {
     parent: Option<Arc<ThreadGroup>>,
     umask: Option<u32>,
     pri: Option<i8>,
-    sigstate: Option<Arc<SpinLock<SignalState>>>,
+    sigstate: Option<Arc<SpinLock<SignalActionState>>>,
     rsrc_lim: Option<Arc<SpinLock<ResourceLimits>>>,
 }
 
@@ -41,7 +41,7 @@ impl ThreadGroupBuilder {
     }
 
     /// Sets the signal state of the thread group.
-    pub fn with_sigstate(mut self, sigstate: Arc<SpinLock<SignalState>>) -> Self {
+    pub fn with_sigstate(mut self, sigstate: Arc<SpinLock<SignalActionState>>) -> Self {
         self.sigstate = Some(sigstate);
         self
     }
@@ -69,7 +69,7 @@ impl ThreadGroupBuilder {
             children: SpinLock::new(BTreeMap::new()),
             signals: self
                 .sigstate
-                .unwrap_or_else(|| Arc::new(SpinLock::new(SignalState::new_default()))),
+                .unwrap_or_else(|| Arc::new(SpinLock::new(SignalActionState::new_default()))),
             rsrc_lim: self
                 .rsrc_lim
                 .unwrap_or_else(|| Arc::new(SpinLock::new(ResourceLimits::default()))),

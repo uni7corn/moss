@@ -8,7 +8,7 @@ use super::{
     thread_group::{
         Tgid,
         builder::ThreadGroupBuilder,
-        signal::{SigId, SigSet, SignalState},
+        signal::{SigId, SigSet, SignalActionState},
     },
     threading::RobustListHead,
 };
@@ -62,7 +62,7 @@ impl OwnedTask {
 
         let thread_group_builder = ThreadGroupBuilder::new(Tgid::idle())
             .with_priority(i8::MIN)
-            .with_sigstate(Arc::new(SpinLock::new(SignalState::new_ignore())));
+            .with_sigstate(Arc::new(SpinLock::new(SignalActionState::new_ignore())));
 
         let task = Task {
             tid: Tid::idle_for_cpu(),
@@ -129,5 +129,16 @@ impl OwnedTask {
 
     pub fn raise_task_signal(&mut self, signal: SigId) {
         self.pending_signals.insert(signal.into());
+    }
+
+    /// Take a pending signal from this task's pending signal queue, or the
+    /// process's pending signal queue, while repsecting the signal mask.
+    pub fn take_signal(&mut self) -> Option<SigId> {
+        self.pending_signals.take_signal(self.sig_mask).or_else(|| {
+            self.process
+                .pending_signals
+                .lock_save_irq()
+                .take_signal(self.sig_mask)
+        })
     }
 }

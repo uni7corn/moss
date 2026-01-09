@@ -74,7 +74,7 @@ enum State {
 pub fn dispatch_userspace_task(ctx: *mut UserCtx) {
     let mut state = State::PickNewTask;
 
-    loop {
+    'dispatch: loop {
         match state {
             State::PickNewTask => {
                 // Pick a new task, potentially context switching to a new task.
@@ -228,91 +228,93 @@ pub fn dispatch_userspace_task(ctx: *mut UserCtx) {
                     continue;
                 }
 
-                // See if there are any signals we need to action.
-                if let Some((id, action)) = {
-                    let task = current_task();
-                    let mut pending_task_sigs = task.pending_signals;
+                {
+                    let mut task = current_task();
 
-                    let mask = task.sig_mask;
-                    task.process
-                        .signals
-                        .lock_save_irq()
-                        .action_signal(mask, &mut pending_task_sigs)
-                } {
-                    match action {
-                        KSignalAction::Term | KSignalAction::Core => {
-                            // Terminate the process, and find a new task.
-                            kernel_exit_with_signal(id, false);
+                    while let Some(signal) = task.take_signal() {
+                        let sigaction = task.process.signals.lock_save_irq().action_signal(signal);
 
-                            state = State::PickNewTask;
-                            continue;
-                        }
-                        KSignalAction::Stop => {
-                            let task = current_task();
+                        match sigaction {
+                            // Signal ignored, look for another.
+                            None => continue,
+                            Some(KSignalAction::Term | KSignalAction::Core) => {
+                                // Terminate the process, and find a new task.
+                                kernel_exit_with_signal(signal, false);
 
-                            // Default action: stop (suspend) the entire process.
-                            let process = &task.process;
-
-                            // Notify the parent that we have stopped (SIGCHLD).
-                            if let Some(parent) = process
-                                .parent
-                                .lock_save_irq()
-                                .as_ref()
-                                .and_then(|p| p.upgrade())
-                            {
-                                parent
-                                    .child_notifiers
-                                    .child_update(process.tgid, ChildState::Stop { signal: id });
-                                parent.signals.lock_save_irq().set_pending(SigId::SIGCHLD);
+                                state = State::PickNewTask;
+                                continue 'dispatch;
                             }
+                            Some(KSignalAction::Stop) => {
+                                // Default action: stop (suspend) the entire process.
+                                let process = &task.process;
 
-                            for thr_weak in process.tasks.lock_save_irq().values() {
-                                if let Some(thr) = thr_weak.upgrade() {
-                                    *thr.state.lock_save_irq() = TaskState::Stopped;
+                                // Notify the parent that we have stopped (SIGCHLD).
+                                if let Some(parent) = process
+                                    .parent
+                                    .lock_save_irq()
+                                    .as_ref()
+                                    .and_then(|p| p.upgrade())
+                                {
+                                    parent
+                                        .child_notifiers
+                                        .child_update(process.tgid, ChildState::Stop { signal });
+
+                                    parent
+                                        .pending_signals
+                                        .lock_save_irq()
+                                        .set_signal(SigId::SIGCHLD);
                                 }
-                            }
 
-                            state = State::PickNewTask;
-                            continue;
-                        }
-                        KSignalAction::Continue => {
-                            let task = current_task();
-                            let process = &task.process;
-
-                            // Wake up all sleeping threads in the process.
-                            for thr_weak in process.tasks.lock_save_irq().values() {
-                                if let Some(thr) = thr_weak.upgrade() {
-                                    let mut st = thr.state.lock_save_irq();
-                                    if *st == TaskState::Sleeping {
-                                        *st = TaskState::Runnable;
+                                for thr_weak in process.tasks.lock_save_irq().values() {
+                                    if let Some(thr) = thr_weak.upgrade() {
+                                        *thr.state.lock_save_irq() = TaskState::Stopped;
                                     }
                                 }
+
+                                state = State::PickNewTask;
+                                continue 'dispatch;
                             }
+                            Some(KSignalAction::Continue) => {
+                                let process = &task.process;
 
-                            // Notify the parent that we have continued (SIGCHLD).
-                            if let Some(parent) = process
-                                .parent
-                                .lock_save_irq()
-                                .as_ref()
-                                .and_then(|p| p.upgrade())
-                            {
-                                parent
-                                    .child_notifiers
-                                    .child_update(process.tgid, ChildState::Continue);
-                                parent.signals.lock_save_irq().set_pending(SigId::SIGCHLD);
+                                // Wake up all sleeping threads in the process.
+                                for thr_weak in process.tasks.lock_save_irq().values() {
+                                    if let Some(thr) = thr_weak.upgrade() {
+                                        let mut st = thr.state.lock_save_irq();
+                                        if *st == TaskState::Sleeping {
+                                            *st = TaskState::Runnable;
+                                        }
+                                    }
+                                }
+
+                                // Notify the parent that we have continued (SIGCHLD).
+                                if let Some(parent) = process
+                                    .parent
+                                    .lock_save_irq()
+                                    .as_ref()
+                                    .and_then(|p| p.upgrade())
+                                {
+                                    parent
+                                        .child_notifiers
+                                        .child_update(process.tgid, ChildState::Continue);
+                                    parent
+                                        .pending_signals
+                                        .lock_save_irq()
+                                        .set_signal(SigId::SIGCHLD);
+                                }
+
+                                // Re-process kernel work for this task (there may be more to do).
+                                state = State::ProcessKernelWork;
+                                continue 'dispatch;
                             }
+                            Some(KSignalAction::Userspace(id, action)) => {
+                                let fut = ArchImpl::do_signal(id, action);
 
-                            // Re-process kernel work for this task (there may be more to do).
-                            state = State::ProcessKernelWork;
-                            continue;
-                        }
-                        KSignalAction::Userspace(id, action) => {
-                            let fut = ArchImpl::do_signal(id, action);
+                                task.ctx.put_signal_work(Box::pin(fut));
 
-                            current_task().ctx.put_signal_work(Box::pin(fut));
-
-                            state = State::ProcessKernelWork;
-                            continue;
+                                state = State::ProcessKernelWork;
+                                continue 'dispatch;
+                            }
                         }
                     }
                 }

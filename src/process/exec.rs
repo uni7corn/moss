@@ -8,7 +8,7 @@ use crate::{
         page::ClaimedPage,
         uaccess::{copy_from_user, cstr::UserCStr},
     },
-    process::{ctx::Context, thread_group::signal::SignalState},
+    process::{ctx::Context, thread_group::signal::SignalActionState},
     sched::current::current_task,
 };
 use alloc::{string::String, vec};
@@ -191,7 +191,7 @@ pub async fn kernel_exec(
 
     current_task.ctx = Context::from_user_ctx(user_ctx);
     *current_task.vm.lock_save_irq() = vm;
-    *current_task.process.signals.lock_save_irq() = SignalState::new_default();
+    *current_task.process.signals.lock_save_irq() = SignalActionState::new_default();
 
     Ok(())
 }

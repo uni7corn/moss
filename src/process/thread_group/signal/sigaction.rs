@@ -112,12 +112,11 @@ pub async fn sys_rt_sigaction(
     let old_action = {
         let task = current_task();
 
-        let sigstate = task.process.signals.lock_save_irq();
-        let mut action_table = sigstate.action.lock_save_irq();
-        let old_action = action_table[sig];
+        let mut sigstate = task.process.signals.lock_save_irq();
+        let old_action = sigstate.action[sig];
 
         if let Some(new_action) = new_act {
-            action_table[sig] = new_action.into();
+            sigstate.action[sig] = new_action.into();
         }
 
         old_action
