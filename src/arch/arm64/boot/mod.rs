@@ -1,7 +1,9 @@
 use super::{
     exceptions::{ExceptionState, secondary_exceptions_init},
     memory::{fixmap::FIXMAPS, mmu::setup_kern_addr_space},
+    proc::vdso::vdso_init,
 };
+use crate::drivers::timer::kick_current_cpu;
 use crate::{
     arch::{ArchImpl, arm64::exceptions::exceptions_init},
     console::setup_console_logger,
@@ -9,10 +11,7 @@ use crate::{
         fdt_prober::{probe_for_fdt_devices, set_fdt_va},
         init::run_initcalls,
     },
-    interrupts::{
-        cpu_messenger::{Message, cpu_messenger_init, message_cpu},
-        get_interrupt_root,
-    },
+    interrupts::{cpu_messenger::cpu_messenger_init, get_interrupt_root},
     kmain,
     memory::{INITAL_ALLOCATOR, PAGE_ALLOC},
     sched::{sched_init_secondary, uspc_ret::dispatch_userspace_task},
@@ -38,9 +37,9 @@ use secondary::{boot_secondaries, cpu_count, save_idmap, secondary_booted};
 
 mod exception_level;
 mod logical_map;
-mod memory;
+pub(super) mod memory;
 mod paging_bootstrap;
-mod secondary;
+pub(super) mod secondary;
 
 global_asm!(include_str!("start.s"));
 
@@ -54,6 +53,7 @@ global_asm!(include_str!("start.s"));
 ///
 /// 0xffff_0000_0000_0000 - 0xffff_8000_0000_0000 | Logical Memory Map
 /// 0xffff_8000_0000_0000 - 0xffff_8000_1fff_ffff | Kernel image
+/// 0xffff_8100_0000_0000 - 0xffff_8100_0000_1000 | VDSO (userspace)
 /// 0xffff_9000_0000_0000 - 0xffff_9000_0020_1fff | Fixed mappings
 /// 0xffff_b000_0000_0000 - 0xffff_b000_0400_0000 | Kernel Heap
 /// 0xffff_b800_0000_0000 - 0xffff_b800_0000_8000 | Kernel Stack (per CPU)
@@ -124,6 +124,10 @@ fn arch_init_stage2(frame: *mut ExceptionState) -> *mut ExceptionState {
 
     cpu_messenger_init(cpu_count());
 
+    if let Err(e) = vdso_init() {
+        panic!("VDSO setup failed: {e}");
+    }
+
     let cmdline = super::fdt::get_cmdline();
 
     kmain(cmdline.unwrap_or_default(), frame);
@@ -131,8 +135,6 @@ fn arch_init_stage2(frame: *mut ExceptionState) -> *mut ExceptionState {
     boot_secondaries();
 
     // Prove that we can send IPIs through the messenger.
-    let _ = message_cpu(1, Message::Ping(ArchImpl::id() as _));
-
     frame
 }
 
@@ -147,6 +149,9 @@ fn arch_init_secondary(ctx_frame: *mut ExceptionState) -> *mut ExceptionState {
     if let Some(ic) = get_interrupt_root() {
         ic.enable_core(ArchImpl::id());
     }
+
+    // Arm the per-CPU system timer so this core starts receiving timer IRQs.
+    kick_current_cpu();
 
     ArchImpl::enable_interrupts();
 

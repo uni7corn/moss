@@ -40,10 +40,11 @@ use crate::{
         mmap::{sys_mmap, sys_mprotect, sys_munmap},
     },
     process::{
+        caps::{sys_capget, sys_capset},
         clone::sys_clone,
         creds::{
             sys_getegid, sys_geteuid, sys_getgid, sys_getresgid, sys_getresuid, sys_gettid,
-            sys_getuid,
+            sys_getuid, sys_setfsgid, sys_setfsuid,
         },
         exec::sys_execve,
         exit::{sys_exit, sys_exit_group},
@@ -52,6 +53,7 @@ use crate::{
             fcntl::sys_fcntl,
             select::{sys_ppoll, sys_pselect6},
         },
+        prctl::sys_prctl,
         sleep::sys_nanosleep,
         thread_group::{
             Pgid,
@@ -68,7 +70,7 @@ use crate::{
         },
         threading::{futex::sys_futex, sys_set_robust_list, sys_set_tid_address},
     },
-    sched::{current_task, sys_sched_yield},
+    sched::{current::current_task, sys_sched_yield},
 };
 use alloc::boxed::Box;
 use libkernel::{
@@ -77,10 +79,10 @@ use libkernel::{
 };
 
 pub async fn handle_syscall() {
-    let task = current_task();
-
     let (nr, arg1, arg2, arg3, arg4, arg5, arg6) = {
-        let ctx = task.ctx.lock_save_irq();
+        let mut task = current_task();
+
+        let ctx = &mut task.ctx;
         let state = ctx.user();
 
         (
@@ -149,13 +151,13 @@ pub async fn handle_syscall() {
             sys_fchownat(
                 arg1.into(),
                 TUA::from_value(arg2 as _),
-                arg3.into(),
-                arg4.into(),
+                arg3 as _,
+                arg4 as _,
                 arg5 as _,
             )
             .await
         }
-        0x37 => sys_fchown(arg1.into(), arg2.into(), arg3.into()).await,
+        0x37 => sys_fchown(arg1.into(), arg2 as _, arg3 as _).await,
         0x38 => {
             sys_openat(
                 arg1.into(),
@@ -270,6 +272,8 @@ pub async fn handle_syscall() {
             )
             .await
         }
+        0x5a => sys_capget(TUA::from_value(arg1 as _), TUA::from_value(arg2 as _)).await,
+        0x5b => sys_capset(TUA::from_value(arg1 as _), TUA::from_value(arg2 as _)).await,
         0x5d => sys_exit(arg1 as _).await,
         0x5e => sys_exit_group(arg1 as _),
         0x60 => sys_set_tid_address(TUA::from_value(arg1 as _)),
@@ -287,6 +291,7 @@ pub async fn handle_syscall() {
         0x63 => sys_set_robust_list(TUA::from_value(arg1 as _), arg2 as _).await,
         0x65 => sys_nanosleep(TUA::from_value(arg1 as _), TUA::from_value(arg2 as _)).await,
         0x71 => sys_clock_gettime(arg1 as _, TUA::from_value(arg2 as _)).await,
+        0x7b => Err(KernelError::NotSupported),
         0x7c => sys_sched_yield(),
         0x81 => sys_kill(arg1 as _, arg2.into()),
         0x82 => sys_tkill(arg1 as _, arg2.into()),
@@ -311,8 +316,8 @@ pub async fn handle_syscall() {
         }
         0x8b => {
             // Special case for sys_rt_sigreturn
-            task.ctx
-                .lock_save_irq()
+            current_task()
+                .ctx
                 .put_signal_work(Box::pin(ArchImpl::do_signal_return()));
 
             return;
@@ -334,11 +339,14 @@ pub async fn handle_syscall() {
             )
             .await
         }
+        0x97 => sys_setfsuid(arg1 as _).map_err(|e| match e {}),
+        0x98 => sys_setfsgid(arg1 as _).map_err(|e| match e {}),
         0x9a => sys_setpgid(arg1 as _, Pgid(arg2 as _)),
         0x9b => sys_getpgid(arg1 as _),
         0xa0 => sys_uname(TUA::from_value(arg1 as _)).await,
         0xa3 => Err(KernelError::InvalidValue),
         0xa6 => sys_umask(arg1 as _).map_err(|e| match e {}),
+        0xa7 => sys_prctl(arg1 as _, arg2 as _),
         0xa9 => sys_gettimeofday(TUA::from_value(arg1 as _), TUA::from_value(arg2 as _)).await,
         0xac => sys_getpid().map_err(|e| match e {}),
         0xad => sys_getppid().map_err(|e| match e {}),
@@ -372,6 +380,7 @@ pub async fn handle_syscall() {
             .await
         }
         0xde => sys_mmap(arg1, arg2, arg3, arg4, arg5.into(), arg6).await,
+        0xdf => Ok(0), // fadvise64_64 is a no-op
         0xe2 => sys_mprotect(VA::from_value(arg1 as _), arg2 as _, arg3 as _),
         0xe9 => Ok(0), // sys_madvise is a no-op
         0x104 => {
@@ -444,9 +453,10 @@ pub async fn handle_syscall() {
             )
             .await
         }
+        0x1b8 => Ok(0), // process_madvise is a no-op
         _ => panic!(
             "Unhandled syscall 0x{nr:x}, PC: 0x{:x}",
-            current_task().ctx.lock_save_irq().user().elr_el1
+            current_task().ctx.user().elr_el1
         ),
     };
 
@@ -455,5 +465,5 @@ pub async fn handle_syscall() {
         Err(e) => kern_err_to_syscall(e),
     };
 
-    task.ctx.lock_save_irq().user_mut().x[0] = ret_val.cast_unsigned() as u64;
+    current_task().ctx.user_mut().x[0] = ret_val.cast_unsigned() as u64;
 }

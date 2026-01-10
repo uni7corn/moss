@@ -1,7 +1,7 @@
 use bitflags::Flags;
 use libkernel::error::{KernelError, Result};
 
-use crate::{process::fd_table::FdFlags, sched::current_task};
+use crate::{process::fd_table::FdFlags, sched::current::current_task_shared};
 
 use super::Fd;
 
@@ -12,7 +12,7 @@ const F_GETFL: u32 = 3; // Get file status flags.
 const F_SETFL: u32 = 4; // Set file status flags.
 
 pub async fn sys_fcntl(fd: Fd, op: u32, arg: usize) -> Result<usize> {
-    let task = current_task();
+    let task = current_task_shared();
 
     match op {
         F_DUPFD => todo!(),

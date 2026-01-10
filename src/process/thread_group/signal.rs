@@ -8,9 +8,8 @@ use core::{
 use bitflags::bitflags;
 use ksigaction::{KSignalAction, UserspaceSigAction};
 use libkernel::memory::{address::UA, region::UserMemoryRegion};
-use ringbuf::Arc;
 
-use crate::{memory::uaccess::UserCopyable, sync::SpinLock};
+use crate::memory::uaccess::UserCopyable;
 
 pub mod kill;
 pub mod ksigaction;
@@ -78,6 +77,23 @@ impl From<SigSet> for SigId {
         // SAFETY: We have performed bounds checking above to ensure the value
         // is within the enum range
         unsafe { transmute(id) }
+    }
+}
+
+impl SigSet {
+    /// Set the signal with id `signal` to true in the set.
+    pub fn set_signal(&mut self, signal: SigId) {
+        *self = self.union(signal.into());
+    }
+
+    /// Remove a set signal from the set, setting it to false, while respecting
+    /// `mask`. Returns the ID of the removed signal.
+    pub fn take_signal(&mut self, mask: SigSet) -> Option<SigId> {
+        let signal = self.difference(mask).iter().next()?;
+
+        self.remove(signal);
+
+        Some(signal.into())
     }
 }
 
@@ -196,91 +212,33 @@ impl AltSigStack {
     }
 }
 
-pub struct SignalState {
-    action: Arc<SpinLock<SigActionSet>>,
-    pending: SigSet,
+#[derive(Clone)]
+pub struct SignalActionState {
+    action: SigActionSet,
     pub alt_stack: Option<AltSigStack>,
 }
 
-impl Clone for SignalState {
-    fn clone(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-}
-
-impl SignalState {
+impl SignalActionState {
     pub fn new_ignore() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Ignore; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Ignore; 64]),
             alt_stack: None,
         }
     }
 
     pub fn new_default() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Default; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Default; 64]),
             alt_stack: None,
         }
     }
 
-    pub fn clone_sharing_action_table(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn clone_copying_action_table(&self) -> Self {
-        Self {
-            action: Arc::new(SpinLock::new(self.action.lock_save_irq().clone())),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn set_pending(&mut self, signal: SigId) {
-        self.pending.insert(signal.into());
-    }
-
-    pub fn action_signal(
-        &mut self,
-        mask: SigSet,
-        task_pending: &mut SigSet,
-    ) -> Option<(SigId, KSignalAction)> {
-        loop {
-            let signal = self
-                .pending
-                .union(*task_pending)
-                .difference(mask)
-                .iter()
-                .next()?;
-
-            // Consume the signal we are about to action.
-            self.pending.remove(signal);
-            task_pending.remove(signal);
-
-            let id: SigId = signal.into();
-
-            match self.action.lock_save_irq()[id] {
-                SigActionState::Ignore => continue, // look for another signal,
-                SigActionState::Default => {
-                    let action = KSignalAction::default_action(id);
-
-                    if let Some(action) = action {
-                        return Some((id, action));
-                    }
-                    // Signal is ignored by default. Look for another signal.
-                }
-                SigActionState::Action(userspace_sig_action) => {
-                    return Some((id, KSignalAction::Userspace(id, userspace_sig_action)));
-                }
+    pub fn action_signal(&self, id: SigId) -> Option<KSignalAction> {
+        match self.action[id] {
+            SigActionState::Ignore => None, // look for another signal,
+            SigActionState::Default => KSignalAction::default_action(id),
+            SigActionState::Action(userspace_sig_action) => {
+                Some(KSignalAction::Userspace(id, userspace_sig_action))
             }
         }
     }

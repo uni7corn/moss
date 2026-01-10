@@ -6,7 +6,7 @@ use crate::{
     fs::open_file::OpenFile,
     kernel_driver,
     process::fd_table::Fd,
-    sched::current_task,
+    sched::current::current_task,
 };
 use alloc::{string::ToString, sync::Arc};
 use libkernel::{

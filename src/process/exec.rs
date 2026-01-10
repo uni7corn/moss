@@ -1,17 +1,19 @@
+use crate::ArchImpl;
 use crate::process::Comm;
+use crate::sched::current::current_task_shared;
 use crate::{
-    arch::{Arch, ArchImpl},
+    arch::Arch,
     fs::VFS,
     memory::{
         page::ClaimedPage,
         uaccess::{copy_from_user, cstr::UserCStr},
     },
-    process::{TaskState, ctx::Context, thread_group::signal::SignalState},
-    sched::current_task,
+    process::{ctx::Context, thread_group::signal::SignalActionState},
+    sched::current::current_task,
 };
 use alloc::{string::String, vec};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
-use auxv::{AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM};
+use auxv::{AT_BASE, AT_ENTRY, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM};
 use core::{ffi::c_char, mem, slice};
 use libkernel::{
     UserAddressSpace, VirtualMemory,
@@ -29,6 +31,8 @@ use libkernel::{
         region::VirtMemoryRegion,
     },
 };
+use object::Endian;
+use object::elf::{ET_DYN, ProgramHeader64};
 use object::{
     LittleEndian,
     elf::{self, PT_LOAD},
@@ -37,35 +41,61 @@ use object::{
 
 mod auxv;
 
+const LINKER_BIAS: usize = 0x0000_7000_0000_0000;
+const PROG_BIAS: usize = 0x0000_5000_0000_0000;
+
 const STACK_END: usize = 0x0000_8000_0000_0000;
 const STACK_SZ: usize = 0x2000 * 0x400;
 const STACK_START: usize = STACK_END - STACK_SZ;
+
+/// Process a set of progream headers from an ELF. Create VMAs for all `PT_LOAD`
+/// segments, optionally applying `bias` to the load address.
+///
+/// If a VMA was found that contains the headers themselves, the address of the
+/// *VMA* is returned.
+fn process_prog_headers<E: Endian>(
+    hdrs: &[ProgramHeader64<E>],
+    vmas: &mut Vec<VMArea>,
+    bias: Option<usize>,
+    elf_file: Arc<dyn Inode>,
+    endian: E,
+) -> Option<VA> {
+    let mut hdr_addr = None;
+
+    for hdr in hdrs {
+        if hdr.p_type(endian) == PT_LOAD {
+            let vma = VMArea::from_pheader(elf_file.clone(), *hdr, endian, bias);
+
+            // Find PHDR: Assumption segment with p_offset == 0 contains
+            // headers.
+            if hdr.p_offset.get(endian) == 0 {
+                hdr_addr = Some(vma.region().start_address());
+            }
+
+            vmas.push(vma);
+        }
+    }
+
+    hdr_addr
+}
 
 pub async fn kernel_exec(
     inode: Arc<dyn Inode>,
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<()> {
+    // Read ELF header
     let mut buf = [0u8; core::mem::size_of::<elf::FileHeader64<LittleEndian>>()];
-    let mut auxv = Vec::new();
-
     inode.read_at(0, &mut buf).await?;
 
     let elf = elf::FileHeader64::<LittleEndian>::parse(buf.as_slice())
         .map_err(|_| ExecError::InvalidElfFormat)?;
     let endian = elf.endian().unwrap();
 
-    // Push program header params.
-    auxv.push(AT_PHNUM);
-    auxv.push(elf.e_phnum.get(endian) as _);
-    auxv.push(AT_PHENT);
-    auxv.push(elf.e_phentsize(endian) as _);
-
-    let mut ph_buf = vec![
-        0u8;
-        elf.e_phnum.get(endian) as usize * elf.e_phentsize.get(endian) as usize
-            + elf.e_phoff.get(endian) as usize
-    ];
+    // Read full program header table
+    let ph_table_size = elf.e_phnum.get(endian) as usize * elf.e_phentsize.get(endian) as usize
+        + elf.e_phoff.get(endian) as usize;
+    let mut ph_buf = vec![0u8; ph_table_size];
 
     inode.read_at(0, &mut ph_buf).await?;
 
@@ -73,29 +103,65 @@ pub async fn kernel_exec(
         .program_headers(endian, ph_buf.as_slice())
         .map_err(|_| ExecError::InvalidPHdrFormat)?;
 
-    let mut vmas = Vec::new();
-    let mut highest_addr = 0;
-
-    for hdr in hdrs {
-        let kind = hdr.p_type(endian);
-
-        if kind == PT_LOAD {
-            vmas.push(VMArea::from_pheader(inode.clone(), *hdr, endian));
-
-            if hdr.p_offset.get(endian) == 0 {
-                // TODO: poteintally more validation that this VA will contain
-                // the program headers.
-                auxv.push(AT_PHDR);
-                auxv.push(hdr.p_vaddr.get(endian) + elf.e_phoff.get(endian));
+    // Detect PT_INTERP (dynamic linker) if present
+    let mut interp_path: Option<String> = None;
+    for hdr in hdrs.iter() {
+        if hdr.p_type(endian) == elf::PT_INTERP {
+            let off = hdr.p_offset(endian) as usize;
+            let filesz = hdr.p_filesz(endian) as usize;
+            if filesz == 0 {
+                break;
             }
 
-            let mapping_end = hdr.p_vaddr(endian) + hdr.p_memsz(endian);
+            let mut ibuf = vec![0u8; filesz];
+            inode.read_at(off as u64, &mut ibuf).await?;
 
-            if mapping_end > highest_addr {
-                highest_addr = mapping_end;
-            }
+            let len = ibuf.iter().position(|&b| b == 0).unwrap_or(filesz);
+            let s = core::str::from_utf8(&ibuf[..len]).map_err(|_| ExecError::InvalidElfFormat)?;
+            interp_path = Some(s.to_string());
+            break;
         }
     }
+
+    // Setup a program bias for PIE.
+    let main_bias = if elf.e_type.get(endian) == ET_DYN {
+        Some(PROG_BIAS)
+    } else {
+        None
+    };
+
+    let mut auxv = vec![
+        AT_PHNUM,
+        elf.e_phnum.get(endian) as _,
+        AT_PHENT,
+        elf.e_phentsize(endian) as _,
+    ];
+
+    let mut vmas = Vec::new();
+
+    // Process the binary progream headers.
+    if let Some(hdr_addr) = process_prog_headers(hdrs, &mut vmas, main_bias, inode.clone(), endian)
+    {
+        auxv.push(AT_PHDR);
+        auxv.push(hdr_addr.add_bytes(elf.e_phoff(endian) as _).value() as _);
+    }
+
+    let main_entry = VA::from_value(elf.e_entry(endian) as usize + main_bias.unwrap_or(0));
+
+    // AT_ENTRY is the same in the static and interp case.
+    auxv.push(AT_ENTRY);
+    auxv.push(main_entry.value() as _);
+
+    let entry_addr = if let Some(path) = interp_path {
+        auxv.push(AT_BASE);
+        auxv.push(LINKER_BIAS as _);
+
+        // Returns the entry address of the interp program.
+        process_interp(path, &mut vmas).await?
+    } else {
+        // Otherwise, it's just the binary itself.
+        main_entry
+    };
 
     vmas.push(VMArea::new(
         VirtMemoryRegion::new(VA::from_value(STACK_START), STACK_SZ),
@@ -104,12 +170,10 @@ pub async fn kernel_exec(
     ));
 
     let mut mem_map = MemoryMap::from_vmas(vmas)?;
-
     let stack_ptr = setup_user_stack(&mut mem_map, &argv, &envp, auxv)?;
 
-    let user_ctx =
-        ArchImpl::new_user_context(VA::from_value(elf.e_entry(endian) as usize), stack_ptr);
-    let mut vm = ProcessVM::from_map(mem_map, VA::from_value(highest_addr as usize));
+    let user_ctx = ArchImpl::new_user_context(entry_addr, stack_ptr);
+    let mut vm = ProcessVM::from_map(mem_map);
 
     // We don't have to worry about actually calling for a full context switch
     // here. Parts of the old process that are replaced will go out of scope and
@@ -119,15 +183,15 @@ pub async fn kernel_exec(
 
     let new_comm = argv.first().map(|s| Comm::new(s.as_str()));
 
-    let current_task = current_task();
+    let mut current_task = current_task();
 
     if let Some(new_comm) = new_comm {
         *current_task.comm.lock_save_irq() = new_comm;
     }
-    *current_task.ctx.lock_save_irq() = Context::from_user_ctx(user_ctx);
-    *current_task.state.lock_save_irq() = TaskState::Runnable;
+
+    current_task.ctx = Context::from_user_ctx(user_ctx);
     *current_task.vm.lock_save_irq() = vm;
-    *current_task.process.signals.lock_save_irq() = SignalState::new_default();
+    *current_task.process.signals.lock_save_irq() = SignalActionState::new_default();
 
     Ok(())
 }
@@ -243,11 +307,45 @@ fn setup_user_stack(
     Ok(VA::from_value(final_sp_val))
 }
 
+// Dynamic linker path: map PT_INTERP interpreter and return start address of
+// the interpreter program.
+async fn process_interp(interp_path: String, vmas: &mut Vec<VMArea>) -> Result<VA> {
+    // Resolve interpreter path from root; this assumes interp_path is absolute.
+    let task = current_task_shared();
+    let path = Path::new(&interp_path);
+    let interp_inode = VFS.resolve_path(path, VFS.root_inode(), &task).await?;
+
+    // Parse interpreter ELF header
+    let mut hdr_buf = [0u8; core::mem::size_of::<elf::FileHeader64<LittleEndian>>()];
+    interp_inode.read_at(0, &mut hdr_buf).await?;
+    let interp_elf = elf::FileHeader64::<LittleEndian>::parse(&hdr_buf[..])
+        .map_err(|_| ExecError::InvalidElfFormat)?;
+    let iendian = interp_elf.endian().unwrap();
+
+    // Read interpreter program headers
+    let interp_ph_table_size = interp_elf.e_phnum.get(iendian) as usize
+        * interp_elf.e_phentsize.get(iendian) as usize
+        + interp_elf.e_phoff.get(iendian) as usize;
+    let mut interp_ph_buf = vec![0u8; interp_ph_table_size];
+    interp_inode.read_at(0, &mut interp_ph_buf).await?;
+    let interp_hdrs = interp_elf
+        .program_headers(iendian, &interp_ph_buf[..])
+        .map_err(|_| ExecError::InvalidPHdrFormat)?;
+
+    // Build VMAs for interpreter
+    process_prog_headers(interp_hdrs, vmas, Some(LINKER_BIAS), interp_inode, iendian);
+
+    let interp_entry = VA::from_value(LINKER_BIAS + interp_elf.e_entry(iendian) as usize);
+
+    Ok(interp_entry)
+}
+
 pub async fn sys_execve(
     path: TUA<c_char>,
     mut usr_argv: TUA<TUA<c_char>>,
     mut usr_env: TUA<TUA<c_char>>,
 ) -> Result<usize> {
+    let task = current_task_shared();
     let mut buf = [0; 1024];
     let mut argv = Vec::new();
     let mut envp = Vec::new();
@@ -276,11 +374,8 @@ pub async fn sys_execve(
         usr_env = usr_env.add_objs(1);
     }
 
-    let task = current_task();
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
-    let inode = VFS
-        .resolve_path(path, VFS.root_inode(), task.clone())
-        .await?;
+    let inode = VFS.resolve_path(path, VFS.root_inode(), &task).await?;
 
     kernel_exec(inode, argv, envp).await?;
 

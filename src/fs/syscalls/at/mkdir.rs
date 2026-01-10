@@ -1,8 +1,8 @@
-use crate::current_task;
 use crate::fs::VFS;
-use crate::fs::syscalls::at::resolve_at_start_node;
+use crate::fs::syscalls::at::{AtFlags, resolve_at_start_node};
 use crate::memory::uaccess::cstr::UserCStr;
 use crate::process::fd_table::Fd;
+use crate::sched::current::current_task_shared;
 use core::ffi::c_char;
 use libkernel::fs::attr::FilePermissions;
 use libkernel::fs::path::Path;
@@ -15,11 +15,11 @@ pub async fn sys_mkdirat(
 ) -> libkernel::error::Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
-    let start_node = resolve_at_start_node(dirfd, path).await?;
+    let start_node = resolve_at_start_node(dirfd, path, AtFlags::empty()).await?;
     let mode = FilePermissions::from_bits_retain(mode);
 
-    VFS.mkdir(path, start_node, mode, task.clone()).await?;
+    VFS.mkdir(path, start_node, mode, &task).await?;
     Ok(0)
 }

@@ -1,6 +1,6 @@
 use crate::{
     memory::uaccess::{UserCopyable, copy_from_user, copy_to_user},
-    sched::current_task,
+    sched::current::current_task,
 };
 use bitflags::bitflags;
 use libkernel::{

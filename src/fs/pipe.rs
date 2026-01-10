@@ -2,7 +2,7 @@ use crate::{
     kernel::kpipe::KPipe,
     memory::uaccess::copy_to_user,
     process::{fd_table::Fd, thread_group::signal::SigId},
-    sched::current_task,
+    sched::current::current_task,
     sync::CondVar,
 };
 use alloc::{boxed::Box, sync::Arc};
