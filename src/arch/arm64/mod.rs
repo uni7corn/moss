@@ -17,10 +17,12 @@ use memory::{
     mmu::{Arm64KernelAddressSpace, KERN_ADDR_SPC},
     uaccess::{Arm64CopyFromUser, Arm64CopyStrnFromUser, Arm64CopyToUser, try_copy_from_user},
 };
+use ptrace::Arm64PtraceGPRegs;
 
 use crate::{
     process::{
         Task,
+        owned::OwnedTask,
         thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
     },
     sync::SpinLock,
@@ -35,8 +37,10 @@ mod fdt;
 mod memory;
 mod proc;
 pub mod psci;
+pub mod ptrace;
 
 pub struct Aarch64 {}
+
 impl CpuOps for Aarch64 {
     fn id() -> usize {
         MPIDR_EL1.read(MPIDR_EL1::Aff0) as _
@@ -75,6 +79,7 @@ impl VirtualMemory for Aarch64 {
 
 impl Arch for Aarch64 {
     type UserContext = ExceptionState;
+    type PTraceGpRegs = Arm64PtraceGPRegs;
 
     fn new_user_context(entry_point: VA, stack_top: VA) -> Self::UserContext {
         ExceptionState {
@@ -88,6 +93,10 @@ impl Arch for Aarch64 {
 
     fn name() -> &'static str {
         "aarch64"
+    }
+
+    fn cpu_count() -> usize {
+        boot::secondary::cpu_count()
     }
 
     fn do_signal(
@@ -105,7 +114,7 @@ impl Arch for Aarch64 {
         proc::context_switch(new);
     }
 
-    fn create_idle_task() -> Task {
+    fn create_idle_task() -> OwnedTask {
         proc::idle::create_idle_task()
     }
 

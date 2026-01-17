@@ -2,12 +2,15 @@ use core::convert::Infallible;
 
 use crate::{
     memory::uaccess::{UserCopyable, copy_to_user},
-    sched::current_task,
+    sched::current::current_task,
 };
 use libkernel::{
     error::Result,
     memory::address::TUA,
-    proc::ids::{Gid, Uid},
+    proc::{
+        caps::Capabilities,
+        ids::{Gid, Uid},
+    },
 };
 
 unsafe impl UserCopyable for Uid {}
@@ -21,6 +24,7 @@ pub struct Credentials {
     gid: Gid,
     egid: Gid,
     sgid: Gid,
+    pub(super) caps: Capabilities,
 }
 
 impl Credentials {
@@ -32,6 +36,7 @@ impl Credentials {
             gid: Gid::new_root_group(),
             egid: Gid::new_root_group(),
             sgid: Gid::new_root_group(),
+            caps: Capabilities::new_root(),
         }
     }
 
@@ -57,6 +62,10 @@ impl Credentials {
 
     pub fn sgid(&self) -> Gid {
         self.sgid
+    }
+
+    pub fn caps(&self) -> Capabilities {
+        self.caps
     }
 }
 
@@ -84,6 +93,16 @@ pub fn sys_getegid() -> core::result::Result<usize, Infallible> {
     Ok(gid as _)
 }
 
+pub fn sys_setfsuid(_new_id: usize) -> core::result::Result<usize, Infallible> {
+    // Return the uid.  This syscall is deprecated.
+    sys_getuid()
+}
+
+pub fn sys_setfsgid(_new_id: usize) -> core::result::Result<usize, Infallible> {
+    // Return the gid. This syscall is deprecated.
+    sys_getgid()
+}
+
 pub fn sys_gettid() -> core::result::Result<usize, Infallible> {
     let tid: u32 = current_task().tid.0;
 
@@ -91,8 +110,7 @@ pub fn sys_gettid() -> core::result::Result<usize, Infallible> {
 }
 
 pub async fn sys_getresuid(ruid: TUA<Uid>, euid: TUA<Uid>, suid: TUA<Uid>) -> Result<usize> {
-    let task = current_task();
-    let creds = task.creds.lock_save_irq().clone();
+    let creds = current_task().creds.lock_save_irq().clone();
 
     copy_to_user(ruid, creds.uid).await?;
     copy_to_user(euid, creds.euid).await?;
@@ -102,8 +120,7 @@ pub async fn sys_getresuid(ruid: TUA<Uid>, euid: TUA<Uid>, suid: TUA<Uid>) -> Re
 }
 
 pub async fn sys_getresgid(rgid: TUA<Gid>, egid: TUA<Gid>, sgid: TUA<Gid>) -> Result<usize> {
-    let task = current_task();
-    let creds = task.creds.lock_save_irq().clone();
+    let creds = current_task().creds.lock_save_irq().clone();
 
     copy_to_user(rgid, creds.gid).await?;
     copy_to_user(egid, creds.egid).await?;

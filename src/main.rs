@@ -2,6 +2,8 @@
 #![no_main]
 #![feature(used_with_arg)]
 #![feature(likely_unlikely)]
+#![feature(box_as_ptr)]
+
 use alloc::{
     boxed::Box,
     string::{String, ToString},
@@ -26,7 +28,9 @@ use libkernel::{
 };
 use log::{error, warn};
 use process::ctx::UserCtx;
-use sched::{current_task, sched_init, spawn_kernel_work, uspc_ret::dispatch_userspace_task};
+use sched::{
+    current::current_task_shared, sched_init, spawn_kernel_work, uspc_ret::dispatch_userspace_task,
+};
 
 extern crate alloc;
 
@@ -63,7 +67,7 @@ fn on_panic(info: &PanicInfo) -> ! {
     ArchImpl::power_off();
 }
 
-async fn launch_init(opts: KOptions) {
+async fn launch_init(mut opts: KOptions) {
     let init = opts
         .init
         .unwrap_or_else(|| panic!("No init specified in kernel command line"));
@@ -121,7 +125,7 @@ async fn launch_init(opts: KOptions) {
         .await
         .expect("Unable to find init");
 
-    let task = current_task();
+    let task = current_task_shared();
 
     // Ensure that the exec() call applies to init.
     assert!(task.process.tgid.is_init());
@@ -137,7 +141,7 @@ async fn launch_init(opts: KOptions) {
             OpenFlags::O_RDWR,
             VFS.root_inode(),
             FilePermissions::empty(),
-            task.clone(),
+            &task,
         )
         .await
         .expect("Could not open console for init process");
@@ -157,7 +161,13 @@ async fn launch_init(opts: KOptions) {
             .expect("Could not clone FD");
     }
 
-    process::exec::kernel_exec(inode, vec![init.as_str().to_string()], vec![])
+    drop(task);
+
+    let mut init_args = vec![init.as_str().to_string()];
+
+    init_args.append(&mut opts.init_args);
+
+    process::exec::kernel_exec(init.as_path(), inode, init_args, vec![])
         .await
         .expect("Could not launch init process");
 }
@@ -166,6 +176,7 @@ struct KOptions {
     init: Option<PathBuf>,
     root_fs: Option<String>,
     automounts: Vec<(PathBuf, String)>,
+    init_args: Vec<String>,
 }
 
 fn parse_args(args: &str) -> KOptions {
@@ -173,6 +184,7 @@ fn parse_args(args: &str) -> KOptions {
         init: None,
         root_fs: None,
         automounts: Vec::new(),
+        init_args: Vec::new(),
     };
 
     let mut opts = Options::new(args.split(" "));
@@ -181,6 +193,7 @@ fn parse_args(args: &str) -> KOptions {
         match opts.next_opt() {
             Ok(Some(arg)) => match arg {
                 Opt::Long("init") => kopts.init = Some(PathBuf::from(opts.value().unwrap())),
+                Opt::Long("init-arg") => kopts.init_args.push(opts.value().unwrap().to_string()),
                 Opt::Long("rootfs") => kopts.root_fs = Some(opts.value().unwrap().to_string()),
                 Opt::Long("automount") => {
                     let string = opts.value().unwrap();

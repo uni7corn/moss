@@ -1,10 +1,14 @@
+use super::owned::OwnedTask;
+use super::ptrace::{PTrace, TracePoint, ptrace_stop};
 use super::{ctx::Context, thread_group::signal::SigSet};
+use crate::kernel::cpu_id::CpuId;
 use crate::memory::uaccess::copy_to_user;
 use crate::{
     process::{TASK_LIST, Task, TaskState},
-    sched::{self, current_task},
+    sched::{self, current::current_task},
     sync::SpinLock,
 };
+use alloc::boxed::Box;
 use bitflags::bitflags;
 use libkernel::memory::address::TUA;
 use libkernel::{
@@ -51,10 +55,14 @@ pub async fn sys_clone(
 ) -> Result<usize> {
     let flags = CloneFlags::from_bits_truncate(flags);
 
+    // TODO: differentiate between `TracePoint::Fork`, `TracePoint::Clone` and
+    // `TracePoint::VFork`.
+    let should_trace_new_tsk = ptrace_stop(TracePoint::Fork).await;
+
     let new_task = {
         let current_task = current_task();
 
-        let mut user_ctx = *current_task.ctx.lock_save_irq().user();
+        let mut user_ctx = *current_task.ctx.user();
 
         // TODO: Make this arch indepdenant. The child returns '0' on clone.
         user_ctx.x[0] = 0;
@@ -107,9 +115,7 @@ pub async fn sys_clone(
         let files = if flags.contains(CloneFlags::CLONE_FILES) {
             current_task.fd_table.clone()
         } else {
-            Arc::new(SpinLock::new(
-                current_task.fd_table.lock_save_irq().clone_for_exec(),
-            ))
+            Arc::new(SpinLock::new(current_task.fd_table.lock_save_irq().clone()))
         };
 
         let cwd = if flags.contains(CloneFlags::CLONE_FS) {
@@ -124,44 +130,63 @@ pub async fn sys_clone(
             Arc::new(SpinLock::new(current_task.root.lock_save_irq().clone()))
         };
 
+        let ptrace = if flags.contains(CloneFlags::CLONE_PTRACE) || should_trace_new_tsk {
+            current_task.ptrace.lock_save_irq().clone()
+        } else {
+            PTrace::new()
+        };
+
         let creds = current_task.creds.lock_save_irq().clone();
 
-        let new_sigmask = *current_task.sig_mask.lock_save_irq();
+        let new_sigmask = current_task.sig_mask;
 
-        Task {
-            tid,
-            comm: Arc::new(SpinLock::new(*current_task.comm.lock_save_irq())),
-            process: tg,
-            vm,
-            fd_table: files,
-            cwd,
-            root,
-            creds: SpinLock::new(creds),
-            ctx: SpinLock::new(Context::from_user_ctx(user_ctx)),
+        OwnedTask {
+            ctx: Context::from_user_ctx(user_ctx),
             priority: current_task.priority,
-            sig_mask: SpinLock::new(new_sigmask),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(*current_task.deadline.lock_save_irq()),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(if !child_tidptr.is_null() {
+            sig_mask: new_sigmask,
+            pending_signals: if should_trace_new_tsk {
+                // When we want to trace a new task through one of
+                // PTRACE_O_TRACE{FORK,VFORK,CLONE}, stop the child as soon as
+                // it is created.
+                SigSet::SIGSTOP
+            } else {
+                SigSet::empty()
+            },
+            robust_list: None,
+            child_tid_ptr: if !child_tidptr.is_null() {
                 Some(child_tidptr)
             } else {
                 None
+            },
+            t_shared: Arc::new(Task {
+                tid,
+                comm: Arc::new(SpinLock::new(*current_task.comm.lock_save_irq())),
+                process: tg,
+                vm,
+                fd_table: files,
+                cwd,
+                root,
+                creds: SpinLock::new(creds),
+                state: Arc::new(SpinLock::new(TaskState::Runnable)),
+                last_cpu: SpinLock::new(CpuId::this()),
+                ptrace: SpinLock::new(ptrace),
             }),
         }
     };
 
-    TASK_LIST
-        .lock_save_irq()
-        .insert(new_task.descriptor(), Arc::downgrade(&new_task.state));
-
     let tid = new_task.tid;
 
-    sched::insert_task(Arc::new(new_task));
+    TASK_LIST
+        .lock_save_irq()
+        .insert(new_task.descriptor(), Arc::downgrade(&new_task.t_shared));
+
+    new_task
+        .process
+        .tasks
+        .lock_save_irq()
+        .insert(tid, Arc::downgrade(&new_task.t_shared));
+
+    sched::insert_task_cross_cpu(Box::new(new_task));
 
     // Honour CLONE_*SETTID semantics for the parent and (shared-VM) child.
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) && !parent_tidptr.is_null() {

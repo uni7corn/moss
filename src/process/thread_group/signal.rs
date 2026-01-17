@@ -1,16 +1,14 @@
+use crate::{memory::uaccess::UserCopyable, sched::current::current_task};
+use bitflags::bitflags;
 use core::{
     alloc::Layout,
     fmt::Display,
     mem::transmute,
     ops::{Index, IndexMut},
+    task::Poll,
 };
-
-use bitflags::bitflags;
 use ksigaction::{KSignalAction, UserspaceSigAction};
 use libkernel::memory::{address::UA, region::UserMemoryRegion};
-use ringbuf::Arc;
-
-use crate::{memory::uaccess::UserCopyable, sync::SpinLock};
 
 pub mod kill;
 pub mod ksigaction;
@@ -81,6 +79,29 @@ impl From<SigSet> for SigId {
     }
 }
 
+impl SigSet {
+    /// Set the signal with id `signal` to true in the set.
+    pub fn set_signal(&mut self, signal: SigId) {
+        *self = self.union(signal.into());
+    }
+
+    /// Remove a set signal from the set, setting it to false, while respecting
+    /// `mask`. Returns the ID of the removed signal.
+    pub fn take_signal(&mut self, mask: SigSet) -> Option<SigId> {
+        let signal = self.peek_signal(mask)?;
+
+        self.remove(signal.into());
+
+        Some(signal)
+    }
+
+    /// Check whether a signal is set in this set while repseciting the signal
+    /// mask, `mask`. Returns the ID of the set signal.
+    pub fn peek_signal(&self, mask: SigSet) -> Option<SigId> {
+        self.difference(mask).iter().next().map(|x| x.into())
+    }
+}
+
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(clippy::upper_case_acronyms)]
@@ -121,6 +142,13 @@ pub enum SigId {
 impl SigId {
     pub fn user_id(self) -> u64 {
         self as u64 + 1
+    }
+
+    pub fn is_stopping(self) -> bool {
+        matches!(
+            self,
+            Self::SIGSTOP | Self::SIGTSTP | Self::SIGTTIN | Self::SIGTTOU
+        )
     }
 }
 
@@ -196,92 +224,102 @@ impl AltSigStack {
     }
 }
 
-pub struct SignalState {
-    action: Arc<SpinLock<SigActionSet>>,
-    pending: SigSet,
+#[derive(Clone)]
+pub struct SignalActionState {
+    action: SigActionSet,
     pub alt_stack: Option<AltSigStack>,
 }
 
-impl Clone for SignalState {
-    fn clone(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-}
-
-impl SignalState {
+impl SignalActionState {
     pub fn new_ignore() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Ignore; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Ignore; 64]),
             alt_stack: None,
         }
     }
 
     pub fn new_default() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Default; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Default; 64]),
             alt_stack: None,
         }
     }
 
-    pub fn clone_sharing_action_table(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn clone_copying_action_table(&self) -> Self {
-        Self {
-            action: Arc::new(SpinLock::new(self.action.lock_save_irq().clone())),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn set_pending(&mut self, signal: SigId) {
-        self.pending.insert(signal.into());
-    }
-
-    pub fn action_signal(
-        &mut self,
-        mask: SigSet,
-        task_pending: &mut SigSet,
-    ) -> Option<(SigId, KSignalAction)> {
-        loop {
-            let signal = self
-                .pending
-                .union(*task_pending)
-                .difference(mask)
-                .iter()
-                .next()?;
-
-            // Consume the signal we are about to action.
-            self.pending.remove(signal);
-            task_pending.remove(signal);
-
-            let id: SigId = signal.into();
-
-            match self.action.lock_save_irq()[id] {
-                SigActionState::Ignore => continue, // look for another signal,
-                SigActionState::Default => {
-                    let action = KSignalAction::default_action(id);
-
-                    if let Some(action) = action {
-                        return Some((id, action));
-                    }
-                    // Signal is ignored by default. Look for another signal.
-                }
-                SigActionState::Action(userspace_sig_action) => {
-                    return Some((id, KSignalAction::Userspace(id, userspace_sig_action)));
-                }
+    pub fn action_signal(&self, id: SigId) -> Option<KSignalAction> {
+        match self.action[id] {
+            SigActionState::Ignore => None, // look for another signal,
+            SigActionState::Default => KSignalAction::default_action(id),
+            SigActionState::Action(userspace_sig_action) => {
+                Some(KSignalAction::Userspace(id, userspace_sig_action))
             }
         }
     }
+}
+
+pub trait Interruptable<T, F: Future<Output = T>> {
+    /// Mark this operation as interruptable.
+    ///
+    /// When a signal is delivered to this process/task while it is `Sleeping`,
+    /// it may be woken up if there are no running tasks to deliver the signal
+    /// to. If a task is running an `interruptable()` future, then the
+    /// underlying future's execution will be short-circuted by the delivery of
+    /// a signal. If the kernel is running a non-`interruptable()` future, then
+    /// the signal delivery is deferred until either an `interruptable()`
+    /// operation is executed or the system call has finished.
+    ///
+    /// `.await`ing a `interruptable()`-wrapped future returns a
+    /// [InterruptResult].
+    fn interruptable(self) -> InterruptableFut<T, F>;
+}
+
+/// A wrapper for a long-running future, allowing it to be interrupted by a
+/// signal.
+pub struct InterruptableFut<T, F: Future<Output = T>> {
+    sub_fut: F,
+}
+
+impl<T, F: Future<Output = T>> Interruptable<T, F> for F {
+    fn interruptable(self) -> InterruptableFut<T, F> {
+        // TODO: Set the task state to a new variant `Interruptable`. This
+        // allows the `deliver_signal` code to wake up a task to deliver a
+        // signal to where it will be actioned.
+        InterruptableFut { sub_fut: self }
+    }
+}
+
+impl<T, F: Future<Output = T>> Future for InterruptableFut<T, F> {
+    type Output = InterruptResult<T>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        // Try the underlying future first.
+        let res = unsafe {
+            self.map_unchecked_mut(|f| &mut f.sub_fut)
+                .poll(cx)
+                .map(|x| InterruptResult::Uninterrupted(x))
+        };
+
+        if res.is_ready() {
+            return res;
+        }
+
+        // See if there's a pending signal which interrupts this future.
+        if current_task().peek_signal().is_some() {
+            Poll::Ready(InterruptResult::Interrupted)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// The result of running an interruptable operation within the kernel.
+pub enum InterruptResult<T> {
+    /// The operation was interrupted due to the delivery of the specified
+    /// signal. The system call would normally short-circuit and return -EINTR
+    /// at this point.
+    Interrupted,
+    /// The underlying future completed without interruption.
+    Uninterrupted(T),
 }

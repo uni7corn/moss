@@ -8,9 +8,13 @@
 //! The rest of the kernel should use the `ArchImpl` type alias to access
 //! architecture-specific functions and types.
 
-use crate::process::{
-    Task,
-    thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
+use crate::{
+    memory::uaccess::UserCopyable,
+    process::{
+        Task,
+        owned::OwnedTask,
+        thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
+    },
 };
 use alloc::sync::Arc;
 use libkernel::{
@@ -25,7 +29,12 @@ pub trait Arch: CpuOps + VirtualMemory {
     /// with this type.
     type UserContext: Sized + Send + Sync + Clone;
 
+    /// The type for GP regs copied via `PTRACE_GETREGSET`.
+    type PTraceGpRegs: UserCopyable + for<'a> From<&'a Self::UserContext>;
+
     fn name() -> &'static str;
+
+    fn cpu_count() -> usize;
 
     /// Prepares the initial context for a new user-space thread. This sets up
     /// the stack frame so that when we context-switch to it, it will begin
@@ -37,7 +46,7 @@ pub trait Arch: CpuOps + VirtualMemory {
     fn context_switch(new: Arc<Task>);
 
     /// Construct a new idle task.
-    fn create_idle_task() -> Task;
+    fn create_idle_task() -> OwnedTask;
 
     /// Powers off the machine. Implementations must never return.
     fn power_off() -> !;

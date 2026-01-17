@@ -1,4 +1,4 @@
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use libkernel::{
     error::{KernelError, Result},
     fs::OpenFlags,
@@ -6,13 +6,22 @@ use libkernel::{
 
 use super::{Fd, FdFlags, FileDescriptorEntry};
 
-pub fn sys_dup(fd: Fd) -> Result<usize> {
+pub fn dup_fd(fd: Fd, min_fd: Option<Fd>) -> Result<Fd> {
     let task = current_task();
     let mut files = task.fd_table.lock_save_irq();
 
-    let fd = files.get(fd).ok_or(KernelError::BadFd)?;
+    let file = files.get(fd).ok_or(KernelError::BadFd)?;
 
-    let new_fd = files.insert(fd.clone())?;
+    let new_fd = match min_fd {
+        Some(min_fd) => files.insert_above(min_fd, file.clone())?,
+        None => files.insert(file.clone())?,
+    };
+
+    Ok(new_fd)
+}
+
+pub fn sys_dup(fd: Fd) -> Result<usize> {
+    let new_fd = dup_fd(fd, None)?;
 
     Ok(new_fd.as_raw() as _)
 }

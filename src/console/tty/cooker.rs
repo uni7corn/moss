@@ -6,7 +6,7 @@ use crate::kernel::kpipe::KPipe;
 use crate::process::thread_group::Pgid;
 use crate::process::thread_group::signal::SigId;
 use crate::process::thread_group::signal::kill::send_signal_to_pg;
-use crate::sched::current_task;
+use crate::sched::current::current_task;
 use crate::sync::{CondVar, SpinLock};
 use alloc::{sync::Arc, vec::Vec};
 use libkernel::error::Result;

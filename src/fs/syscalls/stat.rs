@@ -1,6 +1,6 @@
 use super::at::stat::Stat;
 use crate::memory::uaccess::copy_to_user;
-use crate::{process::fd_table::Fd, sched::current_task};
+use crate::{process::fd_table::Fd, sched::current::current_task};
 use libkernel::error::Result;
 use libkernel::{error::KernelError, memory::address::TUA};
 

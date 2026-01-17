@@ -38,6 +38,7 @@ pub const EDOM: isize = -33;
 pub const ERANGE: isize = -34;
 pub const EWOULDBLOCK: isize = -EAGAIN;
 pub const ENOSYS: isize = -38;
+pub const EOPNOTSUPP: isize = -95;
 pub const ETIMEDOUT: isize = -110;
 
 pub fn kern_err_to_syscall(err: KernelError) -> isize {
@@ -53,6 +54,10 @@ pub fn kern_err_to_syscall(err: KernelError) -> isize {
         KernelError::NotSupported => ENOSYS,
         KernelError::NoMemory => ENOMEM,
         KernelError::TimedOut => ETIMEDOUT,
+        KernelError::RangeError => ERANGE,
+        KernelError::NoChildProcess => ECHILD,
+        KernelError::OpNotSupported => EOPNOTSUPP,
+        KernelError::Interrupted => EINTR,
         e => todo!("{e}"),
     }
 }

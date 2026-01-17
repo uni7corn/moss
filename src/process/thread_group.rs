@@ -1,17 +1,18 @@
-use super::{Task, Tid};
-use crate::{memory::uaccess::UserCopyable, sync::SpinLock};
+use super::{Task, TaskState, Tid};
+use crate::{memory::uaccess::UserCopyable, sched::waker::create_waker, sync::SpinLock};
 use alloc::{
     collections::btree_map::BTreeMap,
     sync::{Arc, Weak},
 };
 use builder::ThreadGroupBuilder;
+use core::sync::atomic::AtomicU64;
 use core::{
     fmt::Display,
     sync::atomic::{AtomicU32, Ordering},
 };
 use pid::PidT;
 use rsrc_lim::ResourceLimits;
-use signal::{SigSet, SignalState};
+use signal::{SigId, SigSet, SignalActionState};
 use wait::ChildNotifiers;
 
 pub mod builder;
@@ -94,11 +95,14 @@ pub struct ThreadGroup {
     pub umask: SpinLock<u32>,
     pub parent: SpinLock<Option<Weak<ThreadGroup>>>,
     pub children: SpinLock<BTreeMap<Tgid, Arc<ThreadGroup>>>,
-    pub threads: SpinLock<BTreeMap<Tid, Weak<Task>>>,
-    pub signals: Arc<SpinLock<SignalState>>,
+    pub tasks: SpinLock<BTreeMap<Tid, Weak<Task>>>,
+    pub signals: Arc<SpinLock<SignalActionState>>,
     pub rsrc_lim: Arc<SpinLock<ResourceLimits>>,
     pub pending_signals: SpinLock<SigSet>,
+    pub priority: SpinLock<i8>,
     pub child_notifiers: ChildNotifiers,
+    pub utime: AtomicU64,
+    pub stime: AtomicU64,
     next_tid: AtomicU32,
 }
 
@@ -150,6 +154,53 @@ impl ThreadGroup {
 
     pub fn get(id: Tgid) -> Option<Arc<Self>> {
         TG_LIST.lock_save_irq().get(&id).and_then(|x| x.upgrade())
+    }
+
+    pub fn deliver_signal(&self, signal: SigId) {
+        match signal {
+            SigId::SIGKILL => {
+                // Set the sigkill marker in the pending signals and wake up all
+                // tasks in this group.
+                *self.pending_signals.lock_save_irq() = SigSet::SIGKILL;
+
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade()
+                        && matches!(
+                            *task.state.lock_save_irq(),
+                            TaskState::Stopped | TaskState::Sleeping
+                        )
+                    {
+                        create_waker(task.descriptor()).wake();
+                    }
+                }
+            }
+            _ => {
+                self.pending_signals.lock_save_irq().set_signal(signal);
+
+                // See whether there is a task that can action the signal.
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade()
+                        && matches!(
+                            *task.state.lock_save_irq(),
+                            TaskState::Runnable | TaskState::Running
+                        )
+                    {
+                        // Signal delivered. This task will eventually be
+                        // dispatched again by the uspc_ret code and the
+                        // signal picked up.
+                        return;
+                    }
+                }
+
+                // No task will pick up the signal. Wake one up.
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade() {
+                        create_waker(task.descriptor()).wake();
+                        return;
+                    }
+                }
+            }
+        }
     }
 }
 

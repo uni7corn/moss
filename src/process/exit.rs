@@ -1,10 +1,11 @@
 use super::{
-    TaskState,
+    TASK_LIST, TaskState,
+    ptrace::{TracePoint, ptrace_stop},
     thread_group::{ProcessState, Tgid, ThreadGroup, signal::SigId, wait::ChildState},
     threading::futex::{self, key::FutexKey},
 };
-use crate::memory::uaccess::copy_to_user;
-use crate::sched::current_task;
+use crate::sched::current::current_task;
+use crate::{memory::uaccess::copy_to_user, sched::current::current_task_shared};
 use alloc::vec::Vec;
 use libkernel::error::Result;
 use log::warn;
@@ -43,7 +44,7 @@ pub fn do_exit_group(exit_code: ChildState) {
 
     // Signal all other threads in the group to terminate. We iterate over Weak
     // pointers and upgrade them.
-    for thread_weak in process.threads.lock_save_irq().values() {
+    for thread_weak in process.tasks.lock_save_irq().values() {
         if let Some(other_thread) = thread_weak.upgrade() {
             // Don't signal ourselves
             if other_thread.tid != task.tid {
@@ -80,7 +81,10 @@ pub fn do_exit_group(exit_code: ChildState) {
 
     parent.child_notifiers.child_update(process.tgid, exit_code);
 
-    parent.signals.lock_save_irq().set_pending(SigId::SIGCHLD);
+    parent
+        .pending_signals
+        .lock_save_irq()
+        .set_signal(SigId::SIGCHLD);
 
     // 5. This thread is now finished.
     *task.state.lock_save_irq() = TaskState::Finished;
@@ -93,7 +97,9 @@ pub fn kernel_exit_with_signal(signal: SigId, core: bool) {
     do_exit_group(ChildState::SignalExit { signal, core });
 }
 
-pub fn sys_exit_group(exit_code: usize) -> Result<usize> {
+pub async fn sys_exit_group(exit_code: usize) -> Result<usize> {
+    ptrace_stop(TracePoint::Exit).await;
+
     do_exit_group(ChildState::NormalExit {
         code: exit_code as _,
     });
@@ -102,33 +108,37 @@ pub fn sys_exit_group(exit_code: usize) -> Result<usize> {
 }
 
 pub async fn sys_exit(exit_code: usize) -> Result<usize> {
-    let task = current_task();
-
     // Honour CLONE_CHILD_CLEARTID: clear the user TID word and futex-wake any waiters.
-    let ptr = task.child_tid_ptr.lock_save_irq().take();
+    let ptr = current_task().child_tid_ptr.take();
+
+    ptrace_stop(TracePoint::Exit).await;
+
     if let Some(ptr) = ptr {
         copy_to_user(ptr, 0u32).await?;
 
         if let Ok(key) = FutexKey::new_shared(ptr) {
-            futex::wake_key(1, key);
+            futex::wake_key(1, key, u32::MAX);
         } else {
             warn!("Failed to get futex wake key on sys_exit");
         }
     }
 
+    let task = current_task_shared();
     let process = Arc::clone(&task.process);
-    let mut thread_lock = process.threads.lock_save_irq();
+    let mut tasks_lock = process.tasks.lock_save_irq();
 
     // How many threads are left? We must count live ones.
-    let live_threads = thread_lock
+    let live_tasks = tasks_lock
         .values()
         .filter(|t| t.upgrade().is_some())
         .count();
 
-    if live_threads <= 1 {
-        // We are the last thread. This is equivalent to an exit_group. The
-        // exit code for an implicit exit_group is often 0.
-        drop(thread_lock);
+    TASK_LIST.lock_save_irq().remove(&task.descriptor());
+
+    if live_tasks <= 1 {
+        // We are the last task. This is equivalent to an exit_group. The exit
+        // code for an implicit exit_group is often 0.
+        drop(tasks_lock);
 
         // NOTE: We don't need to worry about a race condition here. Since
         // we've established we're the only thread and we're executing a
@@ -144,7 +154,7 @@ pub async fn sys_exit(exit_code: usize) -> Result<usize> {
         *task.state.lock_save_irq() = TaskState::Finished;
 
         // Remove ourself from the process's thread list.
-        thread_lock.remove(&task.tid);
+        tasks_lock.remove(&task.tid);
 
         // 3. This thread stops executing forever. The task struct will be
         // deallocated when the last Arc<Task> is dropped (e.g., by the

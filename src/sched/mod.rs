@@ -1,16 +1,48 @@
-use crate::drivers::timer::now;
+use crate::arch::ArchImpl;
+use crate::drivers::timer::{Instant, now};
+use crate::interrupts::cpu_messenger::{Message, message_cpu};
+use crate::kernel::cpu_id::CpuId;
+use crate::process::owned::OwnedTask;
 use crate::{
-    arch::{Arch, ArchImpl},
+    arch::Arch,
     per_cpu,
-    process::{TASK_LIST, Task, TaskDescriptor, TaskState},
-    sync::OnceLock,
+    process::{TASK_LIST, TaskDescriptor, TaskState},
 };
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc};
-use core::cmp::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
+use current::{CUR_TASK_PTR, current_task};
 use libkernel::{UserAddressSpace, error::Result};
+use log::warn;
+use runqueue::{RunQueue, SwitchResult};
+use sched_task::SchedulableTask;
 
+pub mod current;
+mod runqueue;
+pub mod sched_task;
 pub mod uspc_ret;
 pub mod waker;
+
+per_cpu! {
+    static SCHED_STATE: SchedState = SchedState::new;
+}
+
+/// Default time-slice assigned to runnable tasks.
+const DEFAULT_TIME_SLICE: Duration = Duration::from_millis(4);
+
+/// Fixed-point configuration for virtual-time accounting.
+/// We now use a 65.63 format (65 integer bits, 63 fractional bits) as
+/// recommended by the EEVDF paper to minimise rounding error accumulation.
+pub const VT_FIXED_SHIFT: u32 = 63;
+pub const VT_ONE: u128 = 1u128 << VT_FIXED_SHIFT;
+/// Tolerance used when comparing virtual-time values (see EEVDF, Fixed-Point Arithmetic).
+/// Two virtual-time instants whose integer parts differ by no more than this constant are considered equal.
+pub const VCLOCK_EPSILON: u128 = VT_ONE;
+
+/// Scheduler base weight to ensure tasks always have a strictly positive
+/// scheduling weight. The value is added to a task's priority to obtain its
+/// effective weight (`w_i` in EEVDF paper).
+pub const SCHED_WEIGHT_BASE: i32 = 1024;
 
 /// Schedule a new task.
 ///
@@ -24,52 +56,82 @@ pub mod waker;
 /// 3. If the selected process is the same as the currently running one, no
 ///    switch occurs.
 /// 4. If a new process is selected, it handles the state transitions (`Running`
-///    -&gt; `Runnable` for the old task, `Runnable` -&gt; `Running` for the new task)
-///    and performs the architecture-specific context switch.
+///   > `Runnable` for the old task, `Runnable` > `Running` for the new task)
+///   > and performs the architecture-specific context switch.
 ///
 /// # Returns
 ///
 /// Nothing, but the CPU context will be set to the next runnable task. See
 /// `userspace_return` for how this is invoked.
 fn schedule() {
-    // Mark the current task as runnable so it's considered for scheduling in
-    // the next time-slice.
-    {
-        let task = current_task();
-        let mut task_state = task.state.lock_save_irq();
-
-        if *task_state == TaskState::Running {
-            *task_state = TaskState::Runnable;
-        }
+    // Reentrancy Check
+    if SCHED_STATE.try_borrow_mut().is_none() {
+        warn!(
+            "Scheduler reentrancy detected on CPU {}",
+            CpuId::this().value()
+        );
+        return;
     }
 
-    let previous_task = current_task();
-    let mut sched_state = SCHED_STATE.borrow_mut();
-    let next_task = sched_state.find_next_runnable_task();
-
-    sched_state
-        .switch_to_task(Some(previous_task), next_task.clone())
-        .expect("Could not schedule next task");
+    SCHED_STATE.borrow_mut().do_schedule();
 }
 
 pub fn spawn_kernel_work(fut: impl Future<Output = ()> + 'static + Send) {
-    current_task()
-        .ctx
-        .lock_save_irq()
-        .put_kernel_work(Box::pin(fut));
+    current_task().ctx.put_kernel_work(Box::pin(fut));
 }
 
-/// Insert the given task onto *this* CPUs runqueue.
-pub fn insert_task(task: Arc<Task>) {
+/// Global atomic storing info about the least-tasked CPU.
+/// First 16 bits: CPU ID
+/// Next 24 bits: Weight
+/// Next 24 bits: Number of waiting tasks
+static LEAST_TASKED_CPU_INFO: AtomicU64 = AtomicU64::new(0);
+const WEIGHT_SHIFT: u32 = 16;
+const WAITING_SHIFT: u32 = WEIGHT_SHIFT + 24;
+
+#[cfg(feature = "smp")]
+fn get_best_cpu() -> CpuId {
+    // Get the CPU with the least number of tasks.
+    let least_tasked_cpu_info = LEAST_TASKED_CPU_INFO.load(Ordering::Acquire);
+    CpuId::from_value((least_tasked_cpu_info & 0xffff) as usize)
+}
+
+#[cfg(not(feature = "smp"))]
+fn get_best_cpu() -> CpuId {
+    CpuId::this()
+}
+
+/// Insert the given task onto a CPU's run queue.
+pub fn insert_task(task: Box<OwnedTask>) {
     SCHED_STATE
         .borrow_mut()
-        .run_queue
-        .insert(task.descriptor(), task);
+        .insert_into_runq(SchedulableTask::new(task));
+}
+
+#[cfg(feature = "smp")]
+pub fn insert_task_cross_cpu(task: Box<OwnedTask>) {
+    let cpu = get_best_cpu();
+    if cpu == CpuId::this() {
+        insert_task(task);
+    } else {
+        message_cpu(cpu, Message::PutTask(task)).expect("Failed to send task to CPU");
+    }
+}
+
+#[cfg(not(feature = "smp"))]
+pub fn insert_task_cross_cpu(task: Box<OwnedTask>) {
+    insert_task(task);
 }
 
 pub struct SchedState {
-    running_task: Option<Arc<Task>>,
-    pub run_queue: BTreeMap<TaskDescriptor, Arc<Task>>,
+    run_q: RunQueue,
+    wait_q: BTreeMap<TaskDescriptor, Box<SchedulableTask>>,
+    /// Per-CPU virtual clock (fixed-point 65.63 stored in a u128).
+    /// Expressed in virtual-time units as defined by the EEVDF paper.
+    vclock: u128,
+    /// Real-time moment when `vclock` was last updated.
+    last_update: Option<Instant>,
+    /// Force a reschedule.
+    force_resched: bool,
 }
 
 unsafe impl Send for SchedState {}
@@ -77,111 +139,185 @@ unsafe impl Send for SchedState {}
 impl SchedState {
     pub const fn new() -> Self {
         Self {
-            running_task: None,
-            run_queue: BTreeMap::new(),
+            run_q: RunQueue::new(),
+            wait_q: BTreeMap::new(),
+            vclock: 0,
+            last_update: None,
+            force_resched: false,
         }
     }
 
-    fn switch_to_task(
-        &mut self,
-        previous_task: Option<Arc<Task>>,
-        next_task: Arc<Task>,
-    ) -> Result<()> {
+    /// Update the global least-tasked CPU info atomically.
+    #[cfg(feature = "smp")]
+    fn update_global_least_tasked_cpu_info(&self) {
+        fn none<T>() -> Option<T> {
+            None
+        }
+
+        per_cpu! {
+            static LAST_UPDATE: Option<Instant> = none;
+        }
+
+        // Try and throttle contention on the atomic variable.
+        const MIN_COOLDOWN: Duration = Duration::from_millis(16);
+        if let Some(last) = LAST_UPDATE.borrow().as_ref()
+            && let Some(now) = now()
+            && now - *last < MIN_COOLDOWN
+        {
+            return;
+        }
+        *LAST_UPDATE.borrow_mut() = now();
+
+        let weight = self.run_q.weight();
+        let waiting_tasks = self.wait_q.len() as u64;
+        let cpu_id = CpuId::this().value() as u64;
+        let new_info = (cpu_id & 0xffff)
+            | ((weight & 0xffffff) << WEIGHT_SHIFT)
+            | ((waiting_tasks & 0xffffff) << WAITING_SHIFT);
+        let mut old_info = LEAST_TASKED_CPU_INFO.load(Ordering::Acquire);
+        // Ensure we don't spin forever (possible with a larger number of CPUs)
+        const MAX_RETRIES: usize = 8;
+        // Ensure consistency
+        for _ in 0..MAX_RETRIES {
+            let old_cpu_id = old_info & 0xffff;
+            let old_weight = (old_info >> WEIGHT_SHIFT) & 0xffffff;
+            let old_waiting = (old_info >> WAITING_SHIFT) & 0xffffff;
+            let metric = weight + (waiting_tasks * SCHED_WEIGHT_BASE as u64);
+            let old_metric = old_weight + (old_waiting * SCHED_WEIGHT_BASE as u64);
+            if (cpu_id == old_cpu_id && old_info != new_info) || (metric < old_metric) {
+                match LEAST_TASKED_CPU_INFO.compare_exchange(
+                    old_info,
+                    new_info,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => old_info = x,
+                }
+            }
+        }
+    }
+
+    #[cfg(not(feature = "smp"))]
+    fn update_global_least_tasked_cpu_info(&self) {
+        // No-op on single-core systems.
+    }
+
+    /// Advance the per-CPU virtual clock (`vclock`) by converting the elapsed
+    /// real time since the last update into 65.63-format fixed-point
+    /// virtual-time units:
+    ///     v += (delta t << VT_FIXED_SHIFT) /  sum w
+    /// The caller must pass the current real time (`now_inst`).
+    fn advance_vclock(&mut self, now_inst: Instant) {
+        if let Some(prev) = self.last_update {
+            let delta_real = now_inst - prev;
+            if self.run_q.weight() > 0 {
+                let delta_vt =
+                    ((delta_real.as_nanos()) << VT_FIXED_SHIFT) / self.run_q.weight() as u128;
+                self.vclock = self.vclock.saturating_add(delta_vt);
+            }
+        }
+        self.last_update = Some(now_inst);
+    }
+
+    fn insert_into_runq(&mut self, mut new_task: Box<SchedulableTask>) {
+        let now = now().expect("systimer not running");
+
+        self.advance_vclock(now);
+
+        new_task.inserting_into_runqueue(self.vclock);
+
+        if let Some(current) = self.run_q.current() {
+            // We force a reschedule if:
+            //
+            // We are currently idling, OR The new task has an earlier deadline
+            // than the current task.
+            if current.is_idle_task() || new_task.v_deadline < current.v_deadline {
+                self.force_resched = true;
+            }
+        }
+
+        self.run_q.enqueue_task(new_task);
+
+        self.update_global_least_tasked_cpu_info();
+    }
+
+    pub fn wakeup(&mut self, desc: TaskDescriptor) {
+        if let Some(task) = self.wait_q.remove(&desc) {
+            self.insert_into_runq(task);
+        } else {
+            warn!(
+                "Spurious wakeup for task {:?} on CPU {:?}",
+                desc,
+                CpuId::this().value()
+            );
+        }
+    }
+
+    pub fn do_schedule(&mut self) {
+        self.update_global_least_tasked_cpu_info();
+        // Update Clocks
         let now_inst = now().expect("System timer not initialised");
 
-        if let Some(ref prev_task) = previous_task {
-            *prev_task.last_run.lock_save_irq() = Some(now_inst);
-        }
+        self.advance_vclock(now_inst);
 
-        if let Some(ref prev_task) = previous_task
-            && Arc::ptr_eq(&next_task, prev_task)
-        {
-            // Ensure the task state is running.
-            *next_task.state.lock_save_irq() = TaskState::Running;
-            return Ok(());
-        }
+        let mut needs_resched = self.force_resched;
 
-        // Update vruntime and clear exec_start for the previous task.
-        if let Some(ref prev_task) = previous_task {
-            if let Some(start) = *prev_task.exec_start.lock_save_irq() {
-                let delta = now_inst - start;
-                *prev_task.vruntime.lock_save_irq() += delta.as_nanos() as u64;
+        if let Some(current) = self.run_q.current_mut() {
+            // If the current task is IDLE, we always want to proceed to the
+            // scheduler core to see if a real task has arrived.
+            if current.is_idle_task() {
+                needs_resched = true;
+            } else if current.tick(now_inst) {
+                // Otherwise, check if the real task expired
+                needs_resched = true;
             }
-            *prev_task.exec_start.lock_save_irq() = None;
+        } else {
+            needs_resched = true;
         }
 
-        // Record the start time for the task we are about to run.
-        *next_task.exec_start.lock_save_irq() = Some(now_inst);
-
-        // Context switch, the previous task's state should already been updated
-        // prior to calling this function.
-        if let Some(ref prev_task) = previous_task {
-            debug_assert_eq!(*prev_task.state.lock_save_irq(), TaskState::Runnable);
+        if !needs_resched
+            && let Some(current) = self.run_q.current()
+            && matches!(*current.state.lock_save_irq(), TaskState::Running)
+        {
+            // Fast Path: Only return if we have a valid task (Running state),
+            // it has budget, AND it's not the idle task.
+            return;
         }
 
-        *next_task.state.lock_save_irq() = TaskState::Running;
+        // Reset the force flag for next time.
+        self.force_resched = false;
 
-        // Update the scheduler's state to reflect the new running task.
-        self.running_task = Some(next_task.clone());
+        // Select Next Task.
+        let next_task_desc = self.run_q.find_next_runnable_desc(self.vclock);
 
-        // Perform the architecture-specific context switch.
-        ArchImpl::context_switch(next_task);
+        match self.run_q.switch_tasks(next_task_desc, now_inst) {
+            SwitchResult::AlreadyRunning => {
+                // Nothing to do.
+                return;
+            }
+            SwitchResult::Blocked { old_task } => {
+                // If the blocked task has finished, allow it to drop here so it's
+                // resources are released.
+                if !old_task.state.lock_save_irq().is_finished() {
+                    self.wait_q.insert(old_task.descriptor(), old_task);
+                }
+            }
+            // fall-thru.
+            SwitchResult::Preempted => {}
+        }
 
-        Ok(())
+        // Update all context since the task has switched.
+        if let Some(new_current) = self.run_q.current_mut() {
+            ArchImpl::context_switch(new_current.t_shared.clone());
+            CUR_TASK_PTR.borrow_mut().set_current(&mut new_current.task);
+        }
     }
-
-    fn find_next_runnable_task(&self) -> Arc<Task> {
-        let idle_task = self
-            .run_queue
-            .get(&TaskDescriptor::this_cpus_idle())
-            .expect("Every runqueue should have an idle task");
-
-        self.run_queue
-            .values()
-            // We only care about processes that are ready to run.
-            .filter(|candidate_proc| {
-                let state = *candidate_proc.state.lock_save_irq();
-                // A process is a candidate if it's runnable and NOT the idle task
-                state == TaskState::Runnable && !candidate_proc.is_idle_task()
-            })
-            .min_by(|proc1, proc2| {
-                let vr1 = *proc1.vruntime.lock_save_irq();
-                let vr2 = *proc2.vruntime.lock_save_irq();
-
-                vr1.cmp(&vr2).then_with(|| {
-                    // Tie-breaker: fall back to last run timestamp.
-                    let last_run1 = proc1.last_run.lock_save_irq();
-                    let last_run2 = proc2.last_run.lock_save_irq();
-
-                    match (*last_run1, *last_run2) {
-                        (Some(t1), Some(t2)) => t1.cmp(&t2),
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => Ordering::Equal,
-                    }
-                })
-            })
-            .unwrap_or(idle_task)
-            .clone()
-    }
-}
-
-per_cpu! {
-    pub static SCHED_STATE: SchedState = SchedState::new;
-}
-
-pub fn current_task() -> Arc<Task> {
-    SCHED_STATE
-        .borrow()
-        .running_task
-        .as_ref()
-        .expect("Current task called before initial task created")
-        .clone()
 }
 
 pub fn sched_init() {
-    let idle_task = get_idle_task();
-    let init_task = Arc::new(Task::create_init_task());
+    let idle_task = ArchImpl::create_idle_task();
+    let init_task = OwnedTask::create_init_task();
 
     init_task
         .vm
@@ -190,41 +326,27 @@ pub fn sched_init() {
         .address_space_mut()
         .activate();
 
-    *init_task.state.lock_save_irq() = TaskState::Running;
+    *init_task.state.lock_save_irq() = TaskState::Runnable;
 
     {
         let mut task_list = TASK_LIST.lock_save_irq();
 
-        task_list.insert(idle_task.descriptor(), Arc::downgrade(&idle_task.state));
-        task_list.insert(init_task.descriptor(), Arc::downgrade(&init_task.state));
+        task_list.insert(idle_task.descriptor(), Arc::downgrade(&idle_task.t_shared));
+        task_list.insert(init_task.descriptor(), Arc::downgrade(&init_task.t_shared));
     }
 
-    insert_task(idle_task);
-    insert_task(init_task.clone());
+    insert_task(Box::new(idle_task));
+    insert_task(Box::new(init_task));
 
-    SCHED_STATE
-        .borrow_mut()
-        .switch_to_task(None, init_task)
-        .expect("Failed to switch to init task");
+    schedule();
 }
 
 pub fn sched_init_secondary() {
-    let idle_task = get_idle_task();
+    let idle_task = ArchImpl::create_idle_task();
 
-    insert_task(idle_task.clone());
-
-    SCHED_STATE
-        .borrow_mut()
-        .switch_to_task(None, idle_task)
-        .expect("Failed to swtich to idle task");
-}
-
-fn get_idle_task() -> Arc<Task> {
-    static IDLE_TASK: OnceLock<Arc<Task>> = OnceLock::new();
-
-    IDLE_TASK
-        .get_or_init(|| Arc::new(ArchImpl::create_idle_task()))
-        .clone()
+    insert_task(Box::new(idle_task));
+    // Force update_global_least_tasked_cpu_info
+    SCHED_STATE.borrow().update_global_least_tasked_cpu_info();
 }
 
 pub fn sys_sched_yield() -> Result<usize> {

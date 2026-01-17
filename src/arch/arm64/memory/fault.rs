@@ -2,6 +2,7 @@ use core::mem;
 
 use crate::{
     arch::arm64::{
+        boot::memory::KERNEL_STACK_AREA,
         exceptions::{
             ExceptionState,
             esr::{AbortIss, Exception, IfscCategory},
@@ -9,7 +10,7 @@ use crate::{
         memory::uaccess::UAccessResult,
     },
     memory::fault::{FaultResolution, handle_demand_fault, handle_protection_fault},
-    sched::{current_task, spawn_kernel_work},
+    sched::{current::current_task, spawn_kernel_work},
 };
 use alloc::boxed::Box;
 use libkernel::{
@@ -42,11 +43,14 @@ fn run_mem_fault_handler(exception: Exception, info: AbortIss) -> Result<FaultRe
         let fault_addr = VA::from_value(far as usize);
 
         let task = current_task();
-        let mut vm = task.vm.lock_save_irq();
 
         match info.ifsc.category() {
-            IfscCategory::TranslationFault => handle_demand_fault(&mut vm, fault_addr, access_kind),
+            IfscCategory::TranslationFault => {
+                handle_demand_fault(task.vm.clone(), fault_addr, access_kind)
+            }
             IfscCategory::PermissionFault => {
+                let mut vm = task.vm.lock_save_irq();
+
                 let pg_info = vm
                     .mm_mut()
                     .address_space_mut()
@@ -100,19 +104,31 @@ pub fn handle_kernel_mem_fault(exception: Exception, info: AbortIss, state: &mut
     // If the source of the fault (ELR), wasn't in the uacess fixup section,
     // then any abort genereated by the kernel is a panic since we don't
     // demand-page any kernel memory.
-    panic!("Kernel memory fault detected.  Context: {}", state);
+    //
+    // Try and differentiate between a stack overflow condition and other
+    // faults.
+    if let Some(far) = info.far
+        && KERNEL_STACK_AREA.contains_address(VA::from_value(far as _))
+    {
+        panic!("Kernel stack overflow detected.  Context:\n{}", state);
+    } else {
+        panic!("Kernel memory fault detected.  Context:\n{}", state);
+    }
 }
 
 pub fn handle_mem_fault(exception: Exception, info: AbortIss) {
     match run_mem_fault_handler(exception, info) {
         Ok(FaultResolution::Resolved) => {}
         // TODO: Implement proc signals.
-        Ok(FaultResolution::Denied) => panic!(
-            "SIGSEGV on process {} {:?} PC: {:x}",
-            current_task().process.tgid,
-            exception,
-            current_task().ctx.lock_save_irq().user().elr_el1
-        ),
+        Ok(FaultResolution::Denied) => {
+            let task = current_task();
+            panic!(
+                "SIGSEGV on process {} {:?} PC: {:x}",
+                task.process.tgid,
+                exception,
+                task.ctx.user().elr_el1
+            )
+        }
         // If the page fault involves sleepy kernel work, we can
         // spawn that work on the process, since there is no other
         // kernel work happening.

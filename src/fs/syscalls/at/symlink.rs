@@ -3,10 +3,13 @@ use core::ffi::c_char;
 use libkernel::{error::Result, fs::path::Path, memory::address::TUA};
 
 use crate::{
-    fs::{VFS, syscalls::at::resolve_at_start_node},
+    fs::{
+        VFS,
+        syscalls::at::{AtFlags, resolve_at_start_node},
+    },
     memory::uaccess::cstr::UserCStr,
     process::fd_table::Fd,
-    sched::current_task,
+    sched::current::current_task_shared,
 };
 
 pub async fn sys_symlinkat(
@@ -17,7 +20,7 @@ pub async fn sys_symlinkat(
     let mut buf = [0; 1024];
     let mut buf2 = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let source = Path::new(
         UserCStr::from_ptr(old_name)
             .copy_from_user(&mut buf)
@@ -28,9 +31,9 @@ pub async fn sys_symlinkat(
             .copy_from_user(&mut buf2)
             .await?,
     );
-    let start_node = resolve_at_start_node(new_dirfd, target).await?;
+    let start_node = resolve_at_start_node(new_dirfd, target, AtFlags::empty()).await?;
 
-    VFS.symlink(source, target, start_node, task).await?;
+    VFS.symlink(source, target, start_node, &task).await?;
 
     Ok(0)
 }

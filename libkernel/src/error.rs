@@ -111,6 +111,9 @@ pub enum ExecError {
     #[error("Invalid ELF Format")]
     InvalidElfFormat,
 
+    #[error("Invalid Script Format")]
+    InvalidScriptFormat,
+
     #[error("Invalid Porgram Header Format")]
     InvalidPHdrFormat,
 }
@@ -177,8 +180,20 @@ pub enum KernelError {
     #[error("No such process")]
     NoProcess,
 
+    #[error("No child process")]
+    NoChildProcess,
+
     #[error("Operation timed out")]
     TimedOut,
+
+    #[error("Value out of range")]
+    RangeError,
+
+    #[error("Operation not supported on transport endpoint")]
+    OpNotSupported,
+
+    #[error("Interrupted system call")]
+    Interrupted,
 
     #[error("{0}")]
     Other(&'static str),

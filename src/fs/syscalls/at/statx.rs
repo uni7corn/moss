@@ -1,11 +1,11 @@
 use crate::{
-    current_task,
     fs::{
         VFS,
         syscalls::at::{resolve_at_start_node, resolve_path_flags},
     },
     memory::uaccess::{UserCopyable, copy_to_user, cstr::UserCStr},
     process::fd_table::Fd,
+    sched::current::current_task_shared,
 };
 use core::{ffi::c_char, time::Duration};
 use libkernel::{error::Result, fs::path::Path, memory::address::TUA};
@@ -124,13 +124,13 @@ pub async fn sys_statx(
 ) -> Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = current_task_shared();
     let flags = AtFlags::from_bits_truncate(flags);
     let mask = StatXMask::from_bits_truncate(mask);
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
 
-    let start_node = resolve_at_start_node(dirfd, path).await?;
-    let node = resolve_path_flags(dirfd, path, start_node, task.clone(), flags).await?;
+    let start_node = resolve_at_start_node(dirfd, path, flags).await?;
+    let node = resolve_path_flags(dirfd, path, start_node, &task, flags).await?;
 
     let attr = node.getattr().await?;
 

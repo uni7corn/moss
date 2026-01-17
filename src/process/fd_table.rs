@@ -45,6 +45,7 @@ pub struct FileDescriptorEntry {
     flags: FdFlags,
 }
 
+#[derive(Clone)]
 pub struct FileDescriptorTable {
     entries: Vec<Option<FileDescriptorEntry>>,
     next_fd_hint: usize,
@@ -88,8 +89,8 @@ impl FileDescriptorTable {
         Ok(fd)
     }
 
-    // Insert the given etnry at the specified index. If there was an entry at
-    // that index `Some(entry)` is returned. Otherwise, `None` is returned.
+    /// Insert the given entry at the specified index. If there was an entry at
+    /// that index `Some(entry)` is returned. Otherwise, `None` is returned.
     fn insert_at(&mut self, fd: Fd, entry: FileDescriptorEntry) -> Option<FileDescriptorEntry> {
         let fd_idx = fd.0 as usize;
 
@@ -99,6 +100,29 @@ impl FileDescriptorTable {
         }
 
         self.entries[fd_idx].replace(entry)
+    }
+
+    /// Insert the given entry at or above the specified index, returning the
+    /// file descriptor used.
+    fn insert_above(&mut self, min_fd: Fd, file: Arc<OpenFile>) -> Result<Fd> {
+        let start_idx = min_fd.0 as usize;
+        let entry = FileDescriptorEntry {
+            file,
+            flags: FdFlags::default(),
+        };
+
+        for i in start_idx..self.entries.len() {
+            if self.entries[i].is_none() {
+                let fd = Fd(i as i32);
+                self.insert_at(fd, entry);
+                return Ok(fd);
+            }
+        }
+
+        // No free slot found, so we need to expand the table.
+        let fd = Fd(self.entries.len() as i32);
+        self.entries.push(Some(entry));
+        Ok(fd)
     }
 
     /// Removes a file descriptor from the table, returning the file if it
@@ -117,27 +141,30 @@ impl FileDescriptorTable {
         None
     }
 
-    /// Creates a new `FileDescriptorTable` for a child process during `execve`.
-    /// It duplicates all file descriptors that do not have the `CLOEXEC` flag
-    /// set.
-    pub fn clone_for_exec(&self) -> Self {
-        let new_entries = self
+    /// Called during an `execve`; closes all FDs marked with `CLOEXEC` flag.
+    pub async fn close_cloexec_entries(&mut self) {
+        let fds_to_close = self
             .entries
             .iter()
-            .map(|entry| {
-                entry.as_ref().and_then(|e| {
-                    if !e.flags.contains(FdFlags::CLOEXEC) {
-                        Some(e.clone())
-                    } else {
-                        None
-                    }
-                })
+            .enumerate()
+            .filter_map(|(i, fd)| {
+                if let Some(fd) = fd
+                    && fd.flags.contains(FdFlags::CLOEXEC)
+                {
+                    Some(i)
+                } else {
+                    None
+                }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        Self {
-            entries: new_entries,
-            next_fd_hint: 0, // Recalculate hint on first use in new process.
+        for fd in fds_to_close {
+            if let Some(fd) = self.remove(Fd(fd as _))
+                && let Some(file) = Arc::into_inner(fd)
+            {
+                let (ops, ctx) = &mut *file.lock().await;
+                let _ = ops.release(ctx).await;
+            }
         }
     }
 

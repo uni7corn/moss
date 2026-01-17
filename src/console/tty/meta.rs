@@ -92,6 +92,9 @@ pub const TIOCGWINSZ: usize = 0x5413;
 pub const TIOCSWINSZ: usize = 0x5414;
 pub const TIOCGPGRP: usize = 0x540F;
 pub const TIOCSPGRP: usize = 0x5410;
+pub const TCGETS2: usize = 0x802c542a;
+pub const TCSETS2: usize = 0x402c542b;
+pub const TCSETSW2: usize = 0x402c542c;
 
 pub type Cc = u8;
 
@@ -128,7 +131,46 @@ pub struct Termios {
 
 unsafe impl UserCopyable for Termios {}
 
-impl Default for Termios {
+impl From<Termios2> for Termios {
+    fn from(value: Termios2) -> Self {
+        Self {
+            c_iflag: value.c_iflag,
+            c_oflag: value.c_oflag,
+            c_cflag: value.c_cflag,
+            c_lflag: value.c_lflag,
+            c_line: value.c_line,
+            c_cc: value.c_cc,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Termios2 {
+    pub c_iflag: TermiosInputFlags,   // input mode flags
+    pub c_oflag: TermiosOutputFlags,  // output mode flags
+    pub c_cflag: TermiosControlFlags, // control mode flags
+    pub c_lflag: TermiosLocalFlags,   // local mode flags
+    pub c_line: Cc,                   // line discipline
+    pub c_cc: [Cc; NCCS],             // control characters
+    pub i_speed: u32,                 // input speed
+    pub o_speed: u32,                 // output speed
+}
+
+unsafe impl UserCopyable for Termios2 {}
+
+impl Termios2 {
+    pub(super) fn update_from_termios(&mut self, other: &Termios) {
+        self.c_iflag = other.c_iflag;
+        self.c_oflag = other.c_oflag;
+        self.c_cflag = other.c_cflag;
+        self.c_lflag = other.c_lflag;
+        self.c_line = other.c_line;
+        self.c_cc = other.c_cc;
+    }
+}
+
+impl Default for Termios2 {
     fn default() -> Self {
         let mut c_cc = [0; NCCS];
         c_cc[VINTR] = 3; // ^C
@@ -152,6 +194,8 @@ impl Default for Termios {
                 | TermiosLocalFlags::ECHONL,
             c_line: 0,
             c_cc,
+            i_speed: 38400,
+            o_speed: 38400,
         }
     }
 }
@@ -159,7 +203,7 @@ impl Default for Termios {
 #[derive(Debug, Default)]
 pub struct TtyMetadata {
     pub winsz: WinSize,
-    pub termios: Termios,
+    pub termios: Termios2,
     /// foreground process group.
     pub fg_pg: Option<Pgid>,
 }
