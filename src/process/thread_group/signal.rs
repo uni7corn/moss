@@ -1,21 +1,22 @@
+use crate::{memory::uaccess::UserCopyable, process::Task, sched::current_work};
+use alloc::sync::Arc;
+use bitflags::bitflags;
 use core::{
     alloc::Layout,
     fmt::Display,
     mem::transmute,
     ops::{Index, IndexMut},
+    sync::atomic::{AtomicU64, Ordering},
+    task::Poll,
 };
-
-use bitflags::bitflags;
 use ksigaction::{KSignalAction, UserspaceSigAction};
 use libkernel::memory::{address::UA, region::UserMemoryRegion};
-use ringbuf::Arc;
-
-use crate::{memory::uaccess::UserCopyable, sync::SpinLock};
 
 pub mod kill;
 pub mod ksigaction;
 pub mod sigaction;
 pub mod sigaltstack;
+pub mod signalfd;
 pub mod sigprocmask;
 mod uaccess;
 
@@ -54,6 +55,7 @@ bitflags! {
        const SIGIO      = 1 << 28;
        const SIGPWR     = 1 << 29;
        const SIGUNUSED  = 1 << 30;
+       const UNMASKABLE_SIGNALS = Self::SIGKILL.bits() | Self::SIGSTOP.bits();
     }
 }
 
@@ -78,6 +80,80 @@ impl From<SigSet> for SigId {
         // SAFETY: We have performed bounds checking above to ensure the value
         // is within the enum range
         unsafe { transmute(id) }
+    }
+}
+
+impl SigSet {
+    /// Set the signal with id `signal` to true in the set.
+    pub fn set_signal(&mut self, signal: SigId) {
+        *self = self.union(signal.into());
+    }
+
+    /// Remove a set signal from the set, setting it to false, while respecting
+    /// `mask`. Returns the ID of the removed signal.
+    pub fn take_signal(&mut self, mask: SigSet) -> Option<SigId> {
+        let signal = self.peek_signal(mask)?;
+
+        self.remove(signal.into());
+
+        Some(signal)
+    }
+
+    /// Check whether a signal is set in this set while repseciting the signal
+    /// mask, `mask`. Returns the ID of the set signal.
+    pub fn peek_signal(&self, mask: SigSet) -> Option<SigId> {
+        self.difference(mask).iter().next().map(|x| x.into())
+    }
+}
+
+/// An atomically-accessible signal set.
+pub struct AtomicSigSet(AtomicU64);
+
+impl AtomicSigSet {
+    pub const fn new(set: SigSet) -> Self {
+        Self(AtomicU64::new(set.bits()))
+    }
+
+    pub const fn empty() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Atomically insert a signal into the set.
+    pub fn insert(&self, signal: SigSet) {
+        self.0.fetch_or(signal.bits(), Ordering::Relaxed);
+    }
+
+    /// Check for a pending signal while respecting the mask, without removing
+    /// it.
+    pub fn peek_signal(&self, mask: SigSet) -> Option<SigId> {
+        SigSet::from_bits_retain(self.0.load(Ordering::Relaxed)).peek_signal(mask)
+    }
+
+    /// Atomically remove and return a pending signal while respecting the mask.
+    pub fn take_signal(&self, mask: SigSet) -> Option<SigId> {
+        loop {
+            let cur = self.0.load(Ordering::Relaxed);
+            let set = SigSet::from_bits_retain(cur);
+            let sig = set.peek_signal(mask)?;
+            let new = set.difference(sig.into()).bits();
+            match self
+                .0
+                .compare_exchange(cur, new, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Some(sig),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    /// Load the current signal set as a plain `SigSet`.
+    pub fn load(&self) -> SigSet {
+        SigSet::from_bits_retain(self.0.load(Ordering::Relaxed))
+    }
+
+    /// Store a full signal set.
+    pub fn store(&self, set: SigSet) {
+        self.0.store(set.bits(), Ordering::Relaxed);
     }
 }
 
@@ -122,6 +198,13 @@ impl SigId {
     pub fn user_id(self) -> u64 {
         self as u64 + 1
     }
+
+    pub fn is_stopping(self) -> bool {
+        matches!(
+            self,
+            Self::SIGSTOP | Self::SIGTSTP | Self::SIGTTIN | Self::SIGTTOU
+        )
+    }
 }
 
 impl Display for SigId {
@@ -131,9 +214,6 @@ impl Display for SigId {
         f.write_str(name)
     }
 }
-
-// SIGKILL and SIGSTOP
-const UNMASKABLE_SIGNALS: SigSet = SigSet::SIGKILL.union(SigSet::SIGSTOP);
 
 #[derive(Clone, Copy, Debug)]
 pub enum SigActionState {
@@ -188,7 +268,7 @@ impl AltSigStack {
     }
 
     pub fn restore_alt_stack(&mut self, old_ptr: UA) {
-        self.ptr = old_ptr
+        self.ptr = old_ptr;
     }
 
     pub fn in_use(&self) -> bool {
@@ -196,92 +276,107 @@ impl AltSigStack {
     }
 }
 
-pub struct SignalState {
-    action: Arc<SpinLock<SigActionSet>>,
-    pending: SigSet,
+#[derive(Clone)]
+pub struct SignalActionState {
+    action: SigActionSet,
     pub alt_stack: Option<AltSigStack>,
 }
 
-impl Clone for SignalState {
-    fn clone(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-}
-
-impl SignalState {
+impl SignalActionState {
     pub fn new_ignore() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Ignore; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Ignore; 64]),
             alt_stack: None,
         }
     }
 
     pub fn new_default() -> Self {
         Self {
-            action: Arc::new(SpinLock::new(SigActionSet([SigActionState::Default; 64]))),
-            pending: SigSet::empty(),
+            action: SigActionSet([SigActionState::Default; 64]),
             alt_stack: None,
         }
     }
 
-    pub fn clone_sharing_action_table(&self) -> Self {
-        Self {
-            action: self.action.clone(),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn clone_copying_action_table(&self) -> Self {
-        Self {
-            action: Arc::new(SpinLock::new(self.action.lock_save_irq().clone())),
-            pending: SigSet::empty(),
-            alt_stack: None,
-        }
-    }
-
-    pub fn set_pending(&mut self, signal: SigId) {
-        self.pending.insert(signal.into());
-    }
-
-    pub fn action_signal(
-        &mut self,
-        mask: SigSet,
-        task_pending: &mut SigSet,
-    ) -> Option<(SigId, KSignalAction)> {
-        loop {
-            let signal = self
-                .pending
-                .union(*task_pending)
-                .difference(mask)
-                .iter()
-                .next()?;
-
-            // Consume the signal we are about to action.
-            self.pending.remove(signal);
-            task_pending.remove(signal);
-
-            let id: SigId = signal.into();
-
-            match self.action.lock_save_irq()[id] {
-                SigActionState::Ignore => continue, // look for another signal,
-                SigActionState::Default => {
-                    let action = KSignalAction::default_action(id);
-
-                    if let Some(action) = action {
-                        return Some((id, action));
-                    }
-                    // Signal is ignored by default. Look for another signal.
-                }
-                SigActionState::Action(userspace_sig_action) => {
-                    return Some((id, KSignalAction::Userspace(id, userspace_sig_action)));
-                }
+    pub fn action_signal(&self, id: SigId) -> Option<KSignalAction> {
+        match self.action[id] {
+            SigActionState::Ignore => None, // look for another signal,
+            SigActionState::Default => KSignalAction::default_action(id),
+            SigActionState::Action(userspace_sig_action) => {
+                Some(KSignalAction::Userspace(id, userspace_sig_action))
             }
         }
     }
+}
+
+pub trait Interruptable<T, F: Future<Output = T>> {
+    /// Mark this operation as interruptable.
+    ///
+    /// When a signal is delivered to this process/task while it is `Sleeping`,
+    /// it may be woken up if there are no running tasks to deliver the signal
+    /// to. If a task is running an `interruptable()` future, then the
+    /// underlying future's execution will be short-circuted by the delivery of
+    /// a signal. If the kernel is running a non-`interruptable()` future, then
+    /// the signal delivery is deferred until either an `interruptable()`
+    /// operation is executed or the system call has finished.
+    ///
+    /// `.await`ing a `interruptable()`-wrapped future returns a
+    /// [InterruptResult].
+    fn interruptable(self) -> InterruptableFut<T, F>;
+}
+
+/// A wrapper for a long-running future, allowing it to be interrupted by a
+/// signal.
+pub struct InterruptableFut<T, F: Future<Output = T>> {
+    sub_fut: F,
+    task: Arc<Task>,
+}
+
+impl<T, F: Future<Output = T>> Interruptable<T, F> for F {
+    fn interruptable(self) -> InterruptableFut<T, F> {
+        // TODO: Set the task state to a new variant `Interruptable`. This
+        // allows the `deliver_signal` code to wake up a task to deliver a
+        // signal to where it will be actioned.
+        InterruptableFut {
+            sub_fut: self,
+            task: Arc::clone(&*current_work()),
+        }
+    }
+}
+
+impl<T, F: Future<Output = T>> Future for InterruptableFut<T, F> {
+    type Output = InterruptResult<T>;
+
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        // Try the underlying future first.
+        let this = unsafe { self.get_unchecked_mut() };
+        let res = unsafe {
+            core::pin::Pin::new_unchecked(&mut this.sub_fut)
+                .poll(cx)
+                .map(|x| InterruptResult::Uninterrupted(x))
+        };
+
+        if res.is_ready() {
+            return res;
+        }
+
+        // See if there's a pending signal which interrupts this future.
+        if this.task.peek_signal().is_some() {
+            Poll::Ready(InterruptResult::Interrupted)
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+/// The result of running an interruptable operation within the kernel.
+pub enum InterruptResult<T> {
+    /// The operation was interrupted due to the delivery of the specified
+    /// signal. The system call would normally short-circuit and return -EINTR
+    /// at this point.
+    Interrupted,
+    /// The underlying future completed without interruption.
+    Uninterrupted(T),
 }

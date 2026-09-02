@@ -1,26 +1,29 @@
-use crate::process::Comm;
+use crate::ArchImpl;
+use crate::process::ptrace::{TracePoint, ptrace_stop};
+use crate::process::{Comm, ITimers};
+use crate::sched::syscall_ctx::ProcessCtx;
 use crate::{
-    arch::{Arch, ArchImpl},
+    arch::Arch,
     fs::VFS,
     memory::{
         page::ClaimedPage,
         uaccess::{copy_from_user, cstr::UserCStr},
     },
-    process::{TaskState, ctx::Context, thread_group::signal::SignalState},
-    sched::current_task,
+    process::{ctx::Context, thread_group::signal::SignalActionState},
 };
+use alloc::borrow::ToOwned;
 use alloc::{string::String, vec};
 use alloc::{string::ToString, sync::Arc, vec::Vec};
-use auxv::{AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM};
+use auxv::{AT_BASE, AT_ENTRY, AT_NULL, AT_PAGESZ, AT_PHDR, AT_PHENT, AT_PHNUM, AT_RANDOM};
 use core::{ffi::c_char, mem, slice};
+use libkernel::memory::proc_vm::address_space::{UserAddressSpace, VirtualMemory};
 use libkernel::{
-    UserAddressSpace, VirtualMemory,
     error::{ExecError, KernelError, Result},
     fs::{Inode, path::Path},
     memory::{
         PAGE_SIZE,
         address::{TUA, VA},
-        permissions::PtePermissions,
+        paging::permissions::PtePermissions,
         proc_vm::{
             ProcessVM,
             memory_map::MemoryMap,
@@ -29,6 +32,8 @@ use libkernel::{
         region::VirtMemoryRegion,
     },
 };
+use object::Endian;
+use object::elf::{ET_DYN, ProgramHeader64};
 use object::{
     LittleEndian,
     elf::{self, PT_LOAD},
@@ -37,35 +42,66 @@ use object::{
 
 mod auxv;
 
+const LINKER_BIAS: usize = 0x0000_7000_0000_0000;
+const PROG_BIAS: usize = 0x0000_5000_0000_0000;
+
 const STACK_END: usize = 0x0000_8000_0000_0000;
 const STACK_SZ: usize = 0x2000 * 0x400;
 const STACK_START: usize = STACK_END - STACK_SZ;
 
-pub async fn kernel_exec(
+/// Process a set of progream headers from an ELF. Create VMAs for all `PT_LOAD`
+/// segments, optionally applying `bias` to the load address.
+///
+/// If a VMA was found that contains the headers themselves, the address of the
+/// *VMA* is returned.
+fn process_prog_headers<E: Endian>(
+    hdrs: &[ProgramHeader64<E>],
+    vmas: &mut Vec<VMArea>,
+    bias: Option<usize>,
+    elf_file: Arc<dyn Inode>,
+    path: &Path,
+    endian: E,
+) -> Option<VA> {
+    let mut hdr_addr = None;
+
+    for hdr in hdrs {
+        if hdr.p_type(endian) == PT_LOAD {
+            let mut vma = VMArea::from_pheader(elf_file.clone(), *hdr, endian, bias);
+
+            // Find PHDR: Assumption segment with p_offset == 0 contains
+            // headers.
+            if hdr.p_offset.get(endian) == 0 {
+                hdr_addr = Some(vma.region().start_address());
+            }
+
+            vma.set_name(path.as_str());
+
+            vmas.push(vma);
+        }
+    }
+
+    hdr_addr
+}
+
+async fn exec_elf(
+    ctx: &mut ProcessCtx,
     inode: Arc<dyn Inode>,
+    path: &Path,
     argv: Vec<String>,
     envp: Vec<String>,
 ) -> Result<()> {
+    // Read ELF header
     let mut buf = [0u8; core::mem::size_of::<elf::FileHeader64<LittleEndian>>()];
-    let mut auxv = Vec::new();
-
     inode.read_at(0, &mut buf).await?;
 
     let elf = elf::FileHeader64::<LittleEndian>::parse(buf.as_slice())
         .map_err(|_| ExecError::InvalidElfFormat)?;
     let endian = elf.endian().unwrap();
 
-    // Push program header params.
-    auxv.push(AT_PHNUM);
-    auxv.push(elf.e_phnum.get(endian) as _);
-    auxv.push(AT_PHENT);
-    auxv.push(elf.e_phentsize(endian) as _);
-
-    let mut ph_buf = vec![
-        0u8;
-        elf.e_phnum.get(endian) as usize * elf.e_phentsize.get(endian) as usize
-            + elf.e_phoff.get(endian) as usize
-    ];
+    // Read full program header table
+    let ph_table_size = elf.e_phnum.get(endian) as usize * elf.e_phentsize.get(endian) as usize
+        + elf.e_phoff.get(endian) as usize;
+    let mut ph_buf = vec![0u8; ph_table_size];
 
     inode.read_at(0, &mut ph_buf).await?;
 
@@ -73,63 +109,169 @@ pub async fn kernel_exec(
         .program_headers(endian, ph_buf.as_slice())
         .map_err(|_| ExecError::InvalidPHdrFormat)?;
 
-    let mut vmas = Vec::new();
-    let mut highest_addr = 0;
-
-    for hdr in hdrs {
-        let kind = hdr.p_type(endian);
-
-        if kind == PT_LOAD {
-            vmas.push(VMArea::from_pheader(inode.clone(), *hdr, endian));
-
-            if hdr.p_offset.get(endian) == 0 {
-                // TODO: poteintally more validation that this VA will contain
-                // the program headers.
-                auxv.push(AT_PHDR);
-                auxv.push(hdr.p_vaddr.get(endian) + elf.e_phoff.get(endian));
+    // Detect PT_INTERP (dynamic linker) if present
+    let mut interp_path: Option<String> = None;
+    for hdr in hdrs.iter() {
+        if hdr.p_type(endian) == elf::PT_INTERP {
+            let off = hdr.p_offset(endian) as usize;
+            let filesz = hdr.p_filesz(endian) as usize;
+            if filesz == 0 {
+                break;
             }
 
-            let mapping_end = hdr.p_vaddr(endian) + hdr.p_memsz(endian);
+            let mut ibuf = vec![0u8; filesz];
+            inode.read_at(off as u64, &mut ibuf).await?;
 
-            if mapping_end > highest_addr {
-                highest_addr = mapping_end;
-            }
+            let len = ibuf.iter().position(|&b| b == 0).unwrap_or(filesz);
+            let s = core::str::from_utf8(&ibuf[..len]).map_err(|_| ExecError::InvalidElfFormat)?;
+            interp_path = Some(s.to_string());
+            break;
         }
     }
 
-    vmas.push(VMArea::new(
+    // Set up a program bias for PIE.
+    let main_bias = if elf.e_type.get(endian) == ET_DYN {
+        Some(PROG_BIAS)
+    } else {
+        None
+    };
+
+    let mut auxv = vec![
+        AT_PHNUM,
+        elf.e_phnum.get(endian) as _,
+        AT_PHENT,
+        elf.e_phentsize(endian) as _,
+    ];
+
+    let mut vmas = Vec::new();
+
+    // Process the binary program headers.
+    if let Some(hdr_addr) =
+        process_prog_headers(hdrs, &mut vmas, main_bias, inode.clone(), path, endian)
+    {
+        auxv.push(AT_PHDR);
+        auxv.push(hdr_addr.add_bytes(elf.e_phoff(endian) as _).value() as _);
+    }
+
+    let main_entry = VA::from_value(elf.e_entry(endian) as usize + main_bias.unwrap_or(0));
+
+    // AT_ENTRY is the same in the static and interp case.
+    auxv.push(AT_ENTRY);
+    auxv.push(main_entry.value() as _);
+
+    let entry_addr = if let Some(path) = interp_path {
+        auxv.push(AT_BASE);
+        auxv.push(LINKER_BIAS as _);
+
+        // Returns the entry address of the interp program.
+        process_interp(ctx, path, &mut vmas).await?
+    } else {
+        // Otherwise, it's just the binary itself.
+        main_entry
+    };
+
+    let mut stack_vma = VMArea::new(
         VirtMemoryRegion::new(VA::from_value(STACK_START), STACK_SZ),
         VMAreaKind::Anon,
         VMAPermissions::rw(),
-    ));
+    );
+
+    stack_vma.set_name("[stack]");
+
+    vmas.push(stack_vma);
 
     let mut mem_map = MemoryMap::from_vmas(vmas)?;
-
     let stack_ptr = setup_user_stack(&mut mem_map, &argv, &envp, auxv)?;
 
-    let user_ctx =
-        ArchImpl::new_user_context(VA::from_value(elf.e_entry(endian) as usize), stack_ptr);
-    let mut vm = ProcessVM::from_map(mem_map, VA::from_value(highest_addr as usize));
+    // We are now committed to the exec.  Inform ptrace.
+    ptrace_stop(ctx, TracePoint::Exec).await;
 
-    // We don't have to worry about actually calling for a full context switch
-    // here. Parts of the old process that are replaced will go out of scope and
-    // be cleaned up (open files, etc); We don't need to preseve any extra
-    // state. Simply activate the new process's address space.
-    vm.mm_mut().address_space_mut().activate();
-
+    let user_ctx = ArchImpl::new_user_context(entry_addr, stack_ptr);
+    let vm = ProcessVM::from_map(mem_map);
     let new_comm = argv.first().map(|s| Comm::new(s.as_str()));
 
-    let current_task = current_task();
+    {
+        let current_task = ctx.task_mut();
 
-    if let Some(new_comm) = new_comm {
-        *current_task.comm.lock_save_irq() = new_comm;
+        if let Some(new_comm) = new_comm {
+            *current_task.comm.lock_save_irq() = new_comm;
+        }
+
+        current_task.ctx = Context::from_user_ctx(user_ctx);
+        current_task.vm.replace(vm);
+        current_task.vm.activate();
+        *current_task.process.signals.lock_save_irq() = SignalActionState::new_default();
     }
-    *current_task.ctx.lock_save_irq() = Context::from_user_ctx(user_ctx);
-    *current_task.state.lock_save_irq() = TaskState::Runnable;
-    *current_task.vm.lock_save_irq() = vm;
-    *current_task.process.signals.lock_save_irq() = SignalState::new_default();
+
+    // `CLONE_VFORK` parents must resume as soon as the child has stopped using
+    // the shared address space, before any later async cleanup can block.
+    ctx.shared().process.complete_vfork();
+
+    // Close all the CLOEXEC FDs.
+    let mut fd_table = ctx.shared().fd_table.lock_save_irq().clone();
+    fd_table.close_cloexec_entries().await;
+    *ctx.shared().fd_table.lock_save_irq() = fd_table;
+    *ctx.shared().process.executable.lock_save_irq() = Some(path.to_owned());
+    *ctx.shared().i_timers.lock_save_irq() = ITimers::default();
 
     Ok(())
+}
+
+async fn exec_script(
+    ctx: &mut ProcessCtx,
+    path: &Path,
+    inode: Arc<dyn Inode>,
+    argv: Vec<String>,
+    envp: Vec<String>,
+) -> Result<()> {
+    // Parse shebang line to get interpreter path and arguments
+    let mut buf = vec![0u8; 256];
+    let n = inode.read_at(0, &mut buf).await?;
+    let shebang_line =
+        core::str::from_utf8(&buf[..n]).map_err(|_| ExecError::InvalidScriptFormat)?;
+    let first_line = shebang_line
+        .lines()
+        .next()
+        .ok_or(ExecError::InvalidScriptFormat)?;
+    let parts: Vec<&str> = first_line[2..].split_whitespace().collect();
+    if parts.is_empty() {
+        Err(ExecError::InvalidScriptFormat)?;
+    }
+    let interp_path = parts[0];
+    let interp_args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    // Build new argv: [interpreter, interp_args..., script_path, original_argv...]
+    let mut new_argv = Vec::new();
+    new_argv.push(interp_path.to_string());
+    new_argv.extend(interp_args);
+    new_argv.push(path.as_str().to_string());
+    new_argv.extend(argv.into_iter().skip(1)); // Skip original argv[0]
+    // Resolve interpreter inode
+    let interp_path = Path::new(interp_path);
+    let task = ctx.shared();
+    let interp_inode = VFS
+        .resolve_path(interp_path, VFS.root_inode(), task)
+        .await?;
+    // Execute interpreter
+    exec_elf(ctx, interp_inode, interp_path, new_argv, envp).await?;
+    Ok(())
+}
+
+pub async fn kernel_exec(
+    ctx: &mut ProcessCtx,
+    path: &Path,
+    inode: Arc<dyn Inode>,
+    argv: Vec<String>,
+    envp: Vec<String>,
+) -> Result<()> {
+    let mut buf = [0u8; 4];
+    inode.read_at(0, &mut buf).await?;
+    if buf == [0x7F, b'E', b'L', b'F'] {
+        exec_elf(ctx, inode, path, argv, envp).await
+    } else if buf.starts_with(b"#!") {
+        exec_script(ctx, path, inode, argv, envp).await
+    } else {
+        Err(ExecError::InvalidElfFormat.into())
+    }
 }
 
 // Sets up the user stack according to the System V ABI.
@@ -243,11 +385,57 @@ fn setup_user_stack(
     Ok(VA::from_value(final_sp_val))
 }
 
+// Dynamic linker path: map PT_INTERP interpreter and return start address of
+// the interpreter program.
+async fn process_interp(
+    ctx: &ProcessCtx,
+    interp_path: String,
+    vmas: &mut Vec<VMArea>,
+) -> Result<VA> {
+    // Resolve interpreter path from root; this assumes interp_path is absolute.
+    let task = ctx.shared();
+    let path = Path::new(&interp_path);
+    let interp_inode = VFS.resolve_path(path, VFS.root_inode(), task).await?;
+
+    // Parse interpreter ELF header
+    let mut hdr_buf = [0u8; core::mem::size_of::<elf::FileHeader64<LittleEndian>>()];
+    interp_inode.read_at(0, &mut hdr_buf).await?;
+    let interp_elf = elf::FileHeader64::<LittleEndian>::parse(&hdr_buf[..])
+        .map_err(|_| ExecError::InvalidElfFormat)?;
+    let iendian = interp_elf.endian().unwrap();
+
+    // Read interpreter program headers
+    let interp_ph_table_size = interp_elf.e_phnum.get(iendian) as usize
+        * interp_elf.e_phentsize.get(iendian) as usize
+        + interp_elf.e_phoff.get(iendian) as usize;
+    let mut interp_ph_buf = vec![0u8; interp_ph_table_size];
+    interp_inode.read_at(0, &mut interp_ph_buf).await?;
+    let interp_hdrs = interp_elf
+        .program_headers(iendian, &interp_ph_buf[..])
+        .map_err(|_| ExecError::InvalidPHdrFormat)?;
+
+    // Build VMAs for interpreter
+    process_prog_headers(
+        interp_hdrs,
+        vmas,
+        Some(LINKER_BIAS),
+        interp_inode,
+        path,
+        iendian,
+    );
+
+    let interp_entry = VA::from_value(LINKER_BIAS + interp_elf.e_entry(iendian) as usize);
+
+    Ok(interp_entry)
+}
+
 pub async fn sys_execve(
+    ctx: &mut ProcessCtx,
     path: TUA<c_char>,
     mut usr_argv: TUA<TUA<c_char>>,
     mut usr_env: TUA<TUA<c_char>>,
 ) -> Result<usize> {
+    let task = ctx.shared().clone();
     let mut buf = [0; 1024];
     let mut argv = Vec::new();
     let mut envp = Vec::new();
@@ -276,13 +464,10 @@ pub async fn sys_execve(
         usr_env = usr_env.add_objs(1);
     }
 
-    let task = current_task();
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
-    let inode = VFS
-        .resolve_path(path, VFS.root_inode(), task.clone())
-        .await?;
+    let inode = VFS.resolve_path(path, VFS.root_inode(), &task).await?;
 
-    kernel_exec(inode, argv, envp).await?;
+    kernel_exec(ctx, path, inode, argv, envp).await?;
 
     Ok(0)
 }

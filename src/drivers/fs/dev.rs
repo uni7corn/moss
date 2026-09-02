@@ -7,6 +7,7 @@ use alloc::{
     sync::Arc,
 };
 use async_trait::async_trait;
+use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use libkernel::fs::attr::{FileAttr, FilePermissions};
 use libkernel::fs::{BlockDevice, DirStream, Dirent, Filesystem};
@@ -24,19 +25,30 @@ pub struct DevFs {
 
 impl DevFs {
     pub fn new() -> Arc<Self> {
+        let shm = DevFsINode {
+            id: InodeId::from_fsid_and_inodeid(DEVFS_ID, 1),
+            attr: SpinLock::new(FileAttr {
+                file_type: FileType::Directory,
+                permissions: FilePermissions::from_bits_retain(0o755),
+                ..FileAttr::default()
+            }),
+            kind: InodeKind::Directory(SpinLock::new(BTreeMap::new())),
+        };
+        let mut root_children = BTreeMap::new();
+        root_children.insert("shm".to_string(), Arc::new(shm));
         let root_inode = Arc::new(DevFsINode {
             id: InodeId::from_fsid_and_inodeid(DEVFS_ID, 0),
             attr: SpinLock::new(FileAttr {
                 file_type: FileType::Directory,
-                mode: FilePermissions::from_bits_retain(0o755),
+                permissions: FilePermissions::from_bits_retain(0o755),
                 ..FileAttr::default()
             }),
-            kind: InodeKind::Directory(SpinLock::new(BTreeMap::new())),
+            kind: InodeKind::Directory(SpinLock::new(root_children)),
         });
 
         Arc::new(Self {
             root: root_inode,
-            next_inode_id: AtomicU64::new(1),
+            next_inode_id: AtomicU64::new(2),
         })
     }
 
@@ -44,7 +56,7 @@ impl DevFs {
         &self,
         name: String,
         device_id: CharDevDescriptor,
-        mode: FilePermissions,
+        permissions: FilePermissions,
     ) -> Result<()> {
         let InodeKind::Directory(ref children) = self.root.kind else {
             // This should be impossible as the root is always a directory.
@@ -56,13 +68,17 @@ impl DevFs {
             return Err(KernelError::InUse);
         }
 
-        let id = self.next_inode_id.fetch_add(1, Ordering::SeqCst);
+        let id = InodeId::from_fsid_and_inodeid(
+            DEVFS_ID,
+            self.next_inode_id.fetch_add(1, Ordering::SeqCst),
+        );
 
         let new_inode = Arc::new(DevFsINode {
-            id: InodeId::from_fsid_and_inodeid(DEVFS_ID, id),
+            id,
             attr: SpinLock::new(FileAttr {
+                id,
                 file_type: FileType::CharDevice(device_id),
-                mode,
+                permissions,
                 ..FileAttr::default()
             }),
             // This is the crucial part: we store the device handle.
@@ -83,6 +99,11 @@ impl Filesystem for DevFs {
 
     fn id(&self) -> u64 {
         DEVFS_ID
+    }
+
+    fn magic(&self) -> u64 {
+        // TODO: Is this the right value
+        0x01021994 // TMPFS_MAGIC
     }
 }
 
@@ -145,7 +166,7 @@ impl Inode for DevFsINode {
     async fn getattr(&self) -> Result<FileAttr> {
         let mut attr = self.attr.lock_save_irq().clone();
         if let InodeKind::CharDevice { device_id } = self.kind {
-            attr.file_type = FileType::CharDevice(device_id)
+            attr.file_type = FileType::CharDevice(device_id);
         }
         Ok(attr)
     }
@@ -161,6 +182,10 @@ impl Inode for DevFsINode {
             }
             InodeKind::CharDevice { .. } => Err(FsError::NotADirectory.into()),
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

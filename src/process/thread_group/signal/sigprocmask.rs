@@ -1,15 +1,16 @@
 use crate::memory::uaccess::{copy_from_user, copy_to_user};
-use crate::sched::current_task;
+use crate::sched::syscall_ctx::ProcessCtx;
 use libkernel::error::{KernelError, Result};
 use libkernel::memory::address::TUA;
 
-use super::{SigSet, UNMASKABLE_SIGNALS};
+use super::SigSet;
 
 pub const SIG_BLOCK: u32 = 0;
 pub const SIG_UNBLOCK: u32 = 1;
 pub const SIG_SETMASK: u32 = 2;
 
 pub async fn sys_rt_sigprocmask(
+    ctx: &mut ProcessCtx,
     how: u32,
     set: TUA<SigSet>,
     oldset: TUA<SigSet>,
@@ -26,9 +27,8 @@ pub async fn sys_rt_sigprocmask(
     };
 
     let old_sigmask = {
-        let task = current_task();
-        let mut sigmask = task.sig_mask.lock_save_irq();
-        let old_sigmask = *sigmask;
+        let task = ctx.shared();
+        let old_sigmask = task.sig_mask.load();
 
         if let Some(set) = set {
             let mut new_sigmask = match how {
@@ -39,9 +39,9 @@ pub async fn sys_rt_sigprocmask(
             };
 
             // SIGSTOP and SIGKILL can never be masked.
-            new_sigmask = new_sigmask.union(UNMASKABLE_SIGNALS);
+            new_sigmask.remove(SigSet::UNMASKABLE_SIGNALS);
 
-            *sigmask = new_sigmask;
+            task.sig_mask.store(new_sigmask);
         }
 
         old_sigmask

@@ -1,19 +1,21 @@
 //! Manages the virtual memory address space of a process.
 
-use crate::{
-    UserAddressSpace,
-    error::{KernelError, Result},
+use super::{
+    PAGE_SIZE, address::VA, proc_vm::address_space::UserAddressSpace, region::VirtMemoryRegion,
 };
+use crate::error::{KernelError, Result};
+use alloc::string::ToString;
 use memory_map::{AddressRequest, MemoryMap};
 use vmarea::{AccessKind, FaultValidation, VMAPermissions, VMArea, VMAreaKind};
 
-use super::{PAGE_SIZE, address::VA, region::VirtMemoryRegion};
-
+pub mod address_space;
 pub mod memory_map;
+pub mod pg_offset;
 pub mod vmarea;
 
 const BRK_PERMISSIONS: VMAPermissions = VMAPermissions::rw();
 
+/// The virtual memory state of a user-space process.
 pub struct ProcessVM<AS: UserAddressSpace> {
     mm: MemoryMap<AS>,
     brk: VirtMemoryRegion,
@@ -48,13 +50,26 @@ impl<AS: UserAddressSpace> ProcessVM<AS> {
         Ok(Self { mm, brk })
     }
 
-    pub fn from_map(map: MemoryMap<AS>, brk: VA) -> Self {
+    /// Constructs a `ProcessVM` from an existing memory map.
+    pub fn from_map(map: MemoryMap<AS>) -> Self {
+        // Last entry will be the VMA with the highest address.
+        let brk = map
+            .vmas
+            .last_key_value()
+            .expect("No VMAs in map")
+            .1
+            .region
+            .end_address()
+            // VMAs should already be page-aligned, but just in case.
+            .align_up(PAGE_SIZE);
+
         Self {
             mm: map,
-            brk: VirtMemoryRegion::new(brk.align_up(PAGE_SIZE), 0),
+            brk: VirtMemoryRegion::new(brk, 0),
         }
     }
 
+    /// Creates an empty `ProcessVM` with no mappings and a zero-sized heap.
     pub fn empty() -> Result<Self> {
         Ok(Self {
             mm: MemoryMap::new()?,
@@ -62,6 +77,7 @@ impl<AS: UserAddressSpace> ProcessVM<AS> {
         })
     }
 
+    /// Finds the VMA covering `addr` if the given access type is permitted.
     pub fn find_vma_for_fault(&self, addr: VA, access_type: AccessKind) -> Option<&VMArea> {
         let vma = self.mm.find_vma(addr)?;
 
@@ -72,10 +88,22 @@ impl<AS: UserAddressSpace> ProcessVM<AS> {
         }
     }
 
+    /// Returns a non-mutable reference to the underlying memory map.
+    pub fn mm(&self) -> &MemoryMap<AS> {
+        &self.mm
+    }
+
+    /// Returns a mutable reference to the underlying memory map.
     pub fn mm_mut(&mut self) -> &mut MemoryMap<AS> {
         &mut self.mm
     }
 
+    /// Returns the current start address of the program break (heap).
+    pub fn start_brk(&self) -> VA {
+        self.brk.start_address()
+    }
+
+    /// Returns the current end address of the program break (heap).
     pub fn current_brk(&self) -> VA {
         self.brk.end_address()
     }
@@ -126,6 +154,7 @@ impl<AS: UserAddressSpace> ProcessVM<AS> {
                 growth_size,
                 BRK_PERMISSIONS,
                 VMAreaKind::Anon,
+                "[heap]".to_string(),
             )?;
 
             self.brk = new_brk_region;
@@ -144,6 +173,7 @@ impl<AS: UserAddressSpace> ProcessVM<AS> {
         Ok(new_end_addr)
     }
 
+    /// Clones this process VM, marking all writable pages as copy-on-write.
     pub fn clone_as_cow(&mut self) -> Result<Self> {
         Ok(Self {
             mm: self.mm.clone_as_cow()?,
@@ -163,6 +193,7 @@ mod tests {
             region: VirtMemoryRegion::new(VA::from_value(0x1000), PAGE_SIZE),
             kind: VMAreaKind::Anon, // Simplification for test
             permissions: VMAPermissions::rx(),
+            name: String::new(),
         };
 
         ProcessVM::from_vma(text_vma).unwrap()
@@ -318,6 +349,7 @@ mod tests {
             region: VirtMemoryRegion::new(obstacle_addr, PAGE_SIZE),
             kind: VMAreaKind::Anon,
             permissions: VMAPermissions::ro(),
+            name: String::new(),
         };
         vm.mm.insert_and_merge(obstacle_vma);
         assert_eq!(vm.mm.vma_count(), 2);

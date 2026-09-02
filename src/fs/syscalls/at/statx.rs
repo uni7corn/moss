@@ -1,11 +1,11 @@
 use crate::{
-    current_task,
     fs::{
         VFS,
         syscalls::at::{resolve_at_start_node, resolve_path_flags},
     },
     memory::uaccess::{UserCopyable, copy_to_user, cstr::UserCStr},
     process::fd_table::Fd,
+    sched::syscall_ctx::ProcessCtx,
 };
 use core::{ffi::c_char, time::Duration};
 use libkernel::{error::Result, fs::path::Path, memory::address::TUA};
@@ -70,13 +70,13 @@ pub struct StatX {
     pub stx_btime: StatXTimestamp, // Creation time
     pub stx_ctime: StatXTimestamp, // Change time
     pub stx_mtime: StatXTimestamp, // Modification time
+    pub stx_mnt_id: u64,           // Mount ID
 
     // Currently not supported on any current filesystems
     pub stx_rdev_major: u32,                // Device major ID
     pub stx_rdev_minor: u32,                // Device minor ID
     pub stx_dev_major: u32,                 // Filesystem major ID
     pub stx_dev_minor: u32,                 // Filesystem minor ID
-    pub stx_mnt_id: u64,                    // Mount ID
     pub stx_dio_mem_align: u32,             // Alignment of memory for direct I/O
     pub stx_dio_offset_align: u32,          // Alignment of offset for direct I/O
     pub stx_subvol: u64,                    // Subvolume ID
@@ -116,6 +116,7 @@ impl From<Duration> for StatXTimestamp {
 unsafe impl UserCopyable for StatX {}
 
 pub async fn sys_statx(
+    ctx: &ProcessCtx,
     dirfd: Fd,
     path: TUA<c_char>,
     flags: i32,
@@ -124,13 +125,13 @@ pub async fn sys_statx(
 ) -> Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = ctx.shared().clone();
     let flags = AtFlags::from_bits_truncate(flags);
     let mask = StatXMask::from_bits_truncate(mask);
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
 
-    let start_node = resolve_at_start_node(dirfd, path).await?;
-    let node = resolve_path_flags(dirfd, path, start_node, task.clone(), flags).await?;
+    let start_node = resolve_at_start_node(ctx, dirfd, path, flags).await?;
+    let node = resolve_path_flags(dirfd, path, start_node, &task, flags).await?;
 
     let attr = node.getattr().await?;
 
@@ -146,7 +147,7 @@ pub async fn sys_statx(
 
     if mask.contains(StatXMask::STATX_MODE) {
         stat_x.stx_mask |= StatXMask::STATX_MODE.bits();
-        stat_x.stx_mode |= attr.mode.bits() as u16;
+        stat_x.stx_mode |= attr.mode().bits() as u16;
     }
 
     if mask.contains(StatXMask::STATX_NLINK) {
@@ -197,6 +198,11 @@ pub async fn sys_statx(
     if mask.contains(StatXMask::STATX_BTIME) {
         stat_x.stx_mask |= StatXMask::STATX_BTIME.bits();
         stat_x.stx_btime = attr.btime.into();
+    }
+
+    if mask.contains(StatXMask::STATX_MNT_ID) {
+        stat_x.stx_mask |= StatXMask::STATX_MNT_ID.bits();
+        stat_x.stx_mnt_id = attr.id.fs_id();
     }
 
     stat_x.stx_attributes_mask = StatXAttr::STATX_ATTR_MOUNT_ROOT.bits();

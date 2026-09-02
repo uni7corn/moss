@@ -3,9 +3,12 @@ use alloc::{
     sync::{Arc, Weak},
 };
 use libkernel::{
-    KernAddressSpace, VirtualMemory,
     error::{KernelError, Result},
-    memory::{address::PA, region::PhysMemoryRegion},
+    memory::{
+        address::PA,
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
+        region::PhysMemoryRegion,
+    },
 };
 use log::info;
 use tock_registers::{
@@ -96,7 +99,7 @@ register_structs! {
 }
 
 struct ArmGicV2InterruptContext {
-    raw_id: usize,
+    raw_iar: u32,
     desc: InterruptDescriptor,
     gic: Arc<SpinLock<ArmGicV2>>,
 }
@@ -110,7 +113,8 @@ impl InterruptContext for ArmGicV2InterruptContext {
 impl Drop for ArmGicV2InterruptContext {
     fn drop(&mut self) {
         let gic = self.gic.lock_save_irq();
-        gic.cpu.EOIR.set(self.raw_id as u32);
+        gic.cpu.EOIR.set(self.raw_iar);
+        gic.cpu.DIR.set(self.raw_iar);
     }
 }
 
@@ -147,31 +151,31 @@ impl ArmGicV2 {
 
         // 3. Configure all interrupts
         // Set all interrupts to Group 0 (secure)
-        for i in 0..(num_interrupts / 32) {
-            self.dist.IGROUPR[i].set(0); // Group 0 = 0 (secure interrupts)
+        for reg in self.dist.IGROUPR.iter().take(num_interrupts / 32) {
+            reg.set(0); // Group 0 = 0 (secure interrupts)
         }
 
         // Disable all interrupts
-        for i in 0..(num_interrupts / 32) {
-            self.dist.ICENABLER[i].set(0xFFFF_FFFF);
+        for reg in self.dist.ICENABLER.iter().take(num_interrupts / 32) {
+            reg.set(0xFFFF_FFFF);
         }
 
         // Clear all pending interrupts
-        for i in 0..(num_interrupts / 32) {
-            self.dist.ICPENDR[i].set(0xFFFF_FFFF);
+        for reg in self.dist.ICPENDR.iter().take(num_interrupts / 32) {
+            reg.set(0xFFFF_FFFF);
         }
 
         // Set priorities - default all to 0xA0 (medium priority)
-        for i in 0..(num_interrupts / 4) {
+        for reg in self.dist.IPRIORITYR.iter().take(num_interrupts / 4) {
             // Each IPRIORITYR register covers 4 interrupts, 8 bits each
-            self.dist.IPRIORITYR[i].set(0xA0A0_A0A0);
+            reg.set(0xA0A0_A0A0);
         }
 
         // Configure interrupts as level triggered (0)
-        for i in 0..(num_interrupts / 16) {
+        for reg in self.dist.ICFGR.iter().take(num_interrupts / 16) {
             // Each ICFGR register configures 16 interrupts, 2 bits each.
             // 0 = level triggered, 1 = edge triggered.
-            self.dist.ICFGR[i].set(0);
+            reg.set(0);
         }
 
         // 4. Enable Distributor
@@ -260,16 +264,45 @@ impl InterruptController for ArmGicV2 {
         }
     }
 
-    fn raise_ipi(&mut self, _target_cpu_id: usize) {
-        todo!()
+    fn raise_ipi(&mut self, target_cpu_id: usize) {
+        let cpu_bit = (target_cpu_id & 0x7) as u32;
+        let target_list = 1u32 << cpu_bit;
+
+        let sgi_intid = 0u32;
+        let target_list_filter = 0u32; // use CPUTargetList
+
+        let value = (target_list_filter << 24) | (target_list << 16) | sgi_intid;
+        self.dist.SGIR.set(value);
     }
 
-    fn enable_core(&mut self, _cpu_id: usize) {
-        todo!()
+    fn enable_core(&mut self, cpu_id: usize) {
+        // PMR: allow all priorities.
+        self.cpu.PMR.set(0xFF);
+        // BPR: no priority grouping.
+        self.cpu.BPR.set(0);
+        // Enable signaling from CPU interface.
+        self.cpu.CTLR.set(1);
+
+        // Enable SGIs 0..15 for this core.
+        for i in 0..16 {
+            self.enable_interrupt(InterruptConfig {
+                descriptor: InterruptDescriptor::Ipi(i),
+                trigger: TriggerMode::EdgeRising,
+            });
+        }
+
+        // Enable the per-CPU system timer (PPI 14) so this core starts receiving ticks.
+        self.enable_interrupt(InterruptConfig {
+            descriptor: InterruptDescriptor::Ppi(14),
+            trigger: TriggerMode::EdgeRising,
+        });
+
+        info!("GICv2: CPU interface enabled for core {cpu_id}");
     }
 
     fn read_active_interrupt(&mut self) -> Option<Box<dyn InterruptContext>> {
-        let int_id = self.cpu.IAR.get() as usize;
+        let iar = self.cpu.IAR.get();
+        let int_id = (iar & 0x3ff) as usize; // Interrupt ID is in [9:0]
 
         let descriptor = match int_id {
             0..=15 => InterruptDescriptor::Ipi(int_id),
@@ -281,7 +314,7 @@ impl InterruptController for ArmGicV2 {
         let gic = self.this.upgrade()?;
 
         let context = ArmGicV2InterruptContext {
-            raw_id: int_id,
+            raw_iar: iar,
             desc: descriptor,
             gic,
         };
@@ -357,8 +390,7 @@ pub fn gic_v2_probe(_dm: &mut DriverManager, d: DeviceDescriptor) -> Result<Arc<
             };
 
             info!(
-                "ARM Gic V2 initialising: distributor_regs: {:?} cpu_regs: {:?}",
-                distributor_mem, cpu_mem
+                "ARM Gic V2 initialising: distributor_regs: {distributor_mem:?} cpu_regs: {cpu_mem:?}",
             );
 
             let dev = Arc::new_cyclic(|this| {

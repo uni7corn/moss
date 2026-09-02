@@ -12,10 +12,10 @@ use aarch64_cpu::registers::{ReadWriteable, Readable, Writeable};
 use alloc::{boxed::Box, sync::Arc};
 use core::hint::spin_loop;
 use libkernel::{
-    KernAddressSpace, VirtualMemory,
     error::Result,
     memory::{
         address::{PA, VA},
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
         region::PhysMemoryRegion,
     },
 };
@@ -159,7 +159,7 @@ pub fn imx8ulp_lpuart_probe(
                 .next()
                 .ok_or(NoInterrupts)?;
 
-            let interrupt_node = fdt_node.interrupt_parent().ok_or(NoParentIntterupt)?.node;
+            let interrupt_node = fdt_node.interrupt_parent().ok_or(NoParentInterrupt)?.node;
 
             let interrupt_manager = dm
                 .find_by_name(interrupt_node.name)

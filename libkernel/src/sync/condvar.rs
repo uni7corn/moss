@@ -1,3 +1,5 @@
+//! Async-aware condition variable.
+
 use super::spinlock::SpinLockIrq;
 use super::waker_set::WakerSet;
 use crate::CpuOps;
@@ -5,8 +7,11 @@ use alloc::sync::Arc;
 
 /// The type of wakeup that should occur after a state update.
 pub enum WakeupType {
+    /// Do not wake any waiting task.
     None,
+    /// Wake exactly one waiting task.
     One,
+    /// Wake all waiting tasks.
     All,
 }
 
@@ -64,7 +69,7 @@ impl<S, C: CpuOps> CondVar<S, C> {
     /// # Arguments
     /// * `predicate`: A closure that checks the condition in the underlying
     ///   state. It should return `None` to continue waiting, or `Some(T)` to
-    ///   stop waitng and yield T to the caller.
+    ///   stop waiting and yield T to the caller.
     #[must_use = "futures do nothing unless you `.await` or poll them"]
     pub fn wait_until<T, F>(&self, predicate: F) -> impl Future<Output = T> + use<T, S, C, F>
     where

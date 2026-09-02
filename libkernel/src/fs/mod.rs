@@ -26,30 +26,44 @@ use crate::{
     error::{FsError, KernelError, Result},
     fs::{path::Path, pathbuf::PathBuf},
 };
+use alloc::vec::Vec;
 use alloc::{boxed::Box, string::String, sync::Arc};
 use async_trait::async_trait;
 use attr::{FileAttr, FilePermissions};
+use core::time::Duration;
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct OpenFlags: u32 {
-        const O_RDONLY    = 0b000;
-        const O_WRONLY    = 0b001;
-        const O_RDWR      = 0b010;
-        const O_ACCMODE   = 0b011;
-        const O_CREAT     = 0o100;
-        const O_EXCL      = 0o200;
-        const O_TRUNC     = 0o1000;
-        const O_DIRECTORY = 0o200000;
-        const O_APPEND    = 0o2000;
-        const O_NONBLOCK  = 0o4000;
-        const O_CLOEXEC   = 0o2000000;
+mod _open_flags {
+    #![allow(missing_docs)]
+    bitflags::bitflags! {
+        /// Flags used when opening a file, corresponding to POSIX `O_*` constants.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub struct OpenFlags: u32 {
+            const O_RDONLY    = 0b000;
+            const O_WRONLY    = 0b001;
+            const O_RDWR      = 0b010;
+            const O_ACCMODE   = 0b011;
+            const O_CREAT     = 0o100;
+            const O_EXCL      = 0o200;
+            const O_TRUNC     = 0o1000;
+            const O_DIRECTORY = 0o200000;
+            const O_APPEND    = 0o2000;
+            const O_NONBLOCK  = 0o4000;
+            const O_CLOEXEC   = 0o2000000;
+        }
     }
 }
+pub use _open_flags::OpenFlags;
 
-// Reserved psuedo filesystem instances created internally in the kernel.
+// Reserved pseudo filesystem instances created internally in the kernel.
+/// Filesystem instance ID for the device filesystem.
 pub const DEVFS_ID: u64 = 1;
+/// Filesystem instance ID for the proc filesystem.
 pub const PROCFS_ID: u64 = 2;
+/// Filesystem instance ID for the sys filesystem.
+pub const SYSFS_ID: u64 = 3;
+/// Filesystem instance ID for the cgroup filesystem.
+pub const CGROUPFS_ID: u64 = 4;
+/// Starting ID for user-mounted filesystem instances.
 pub const FS_ID_START: u64 = 10;
 
 /// Trait for a mounted filesystem instance. Its main role is to act as a
@@ -62,6 +76,9 @@ pub trait Filesystem: Send + Sync {
     /// Returns the instance ID for this FS.
     fn id(&self) -> u64;
 
+    /// Get magic
+    fn magic(&self) -> u64;
+
     /// Flushes all pending data to the underlying storage device(s).
     ///
     /// The default implementation is a no-op so that read-only filesystems do
@@ -71,30 +88,34 @@ pub trait Filesystem: Send + Sync {
     }
 }
 
-// A unique identifier for an inode across the entire VFS. A tuple of
-// (filesystem_id, inode_number).
+/// A unique identifier for an inode across the entire VFS, combining a filesystem ID and inode number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct InodeId(u64, u64);
 
 impl InodeId {
+    /// Creates an `InodeId` from a filesystem ID and an inode number.
     pub fn from_fsid_and_inodeid(fs_id: u64, inode_id: u64) -> Self {
         Self(fs_id, inode_id)
     }
 
+    /// Returns a sentinel `InodeId` used as a placeholder.
     pub fn dummy() -> Self {
         Self(u64::MAX, u64::MAX)
     }
 
+    /// Returns the filesystem ID component.
     pub fn fs_id(self) -> u64 {
         self.0
     }
 
+    /// Returns the inode number component.
     pub fn inode_id(self) -> u64 {
         self.1
     }
 }
 
 /// Standard POSIX file types.
+#[allow(missing_docs)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum FileType {
     File,
@@ -131,13 +152,18 @@ pub trait DirStream: Send + Sync {
 /// Represents a single directory entry.
 #[derive(Debug, Clone)]
 pub struct Dirent {
+    /// The inode identifier of this entry.
     pub id: InodeId,
+    /// The name of this directory entry.
     pub name: String,
+    /// The type of file this entry represents.
     pub file_type: FileType,
+    /// The byte offset of this entry within the directory.
     pub offset: u64,
 }
 
 impl Dirent {
+    /// Creates a new directory entry.
     pub fn new(name: String, id: InodeId, file_type: FileType, offset: u64) -> Self {
         Self {
             id,
@@ -151,8 +177,11 @@ impl Dirent {
 /// Specifies how to seek within a file, mirroring `std::io::SeekFrom`.
 #[derive(Debug, Copy, Clone)]
 pub enum SeekFrom {
+    /// Seek from the beginning of the file.
     Start(u64),
+    /// Seek from the end of the file.
     End(i64),
+    /// Seek relative to the current position.
     Current(i64),
 }
 
@@ -211,6 +240,34 @@ pub trait Inode: Send + Sync + Any {
         Err(KernelError::NotSupported)
     }
 
+    /// Gets an extended attribute.
+    async fn getxattr(&self, _name: &str) -> Result<Vec<u8>> {
+        Err(KernelError::NotSupported)
+    }
+
+    /// Sets an extended attribute.
+    /// Can only create an attribute if `create` is true.
+    /// Can only replace an existing attribute if `replace` is true.
+    async fn setxattr(
+        &self,
+        _name: &str,
+        _buf: &[u8],
+        _create: bool,
+        _replace: bool,
+    ) -> Result<()> {
+        Err(KernelError::NotSupported)
+    }
+
+    /// Removes an extended attribute.
+    async fn removexattr(&self, _name: &str) -> Result<()> {
+        Err(KernelError::NotSupported)
+    }
+
+    /// Lists all extended attribute names.
+    async fn listxattr(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Looks up a name within a directory, returning the corresponding inode.
     async fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>> {
         Err(KernelError::NotSupported)
@@ -222,6 +279,7 @@ pub trait Inode: Send + Sync + Any {
         _name: &str,
         _file_type: FileType,
         _permissions: FilePermissions,
+        _time: Option<Duration>,
     ) -> Result<Arc<dyn Inode>> {
         Err(KernelError::NotSupported)
     }
@@ -291,5 +349,94 @@ pub trait Inode: Send + Sync + Any {
     /// not need to override it.
     async fn datasync(&self) -> Result<()> {
         Ok(())
+    }
+
+    /// Return this inode as an `Any` object, suitable for downcasting.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// A simplified trait for read-only files in procfs/sysfs that provides default implementations
+/// for common inode operations.
+#[async_trait]
+pub trait SimpleFile {
+    /// Returns the inode ID of this file.
+    fn id(&self) -> InodeId;
+    /// Returns the file metadata.
+    async fn getattr(&self) -> Result<FileAttr>;
+    /// Reads the entire file contents into a byte vector.
+    async fn read(&self) -> Result<Vec<u8>>;
+    /// Reads the target of a symbolic link, if applicable.
+    async fn readlink(&self) -> Result<PathBuf> {
+        Err(KernelError::NotSupported)
+    }
+}
+
+#[allow(missing_docs)]
+#[async_trait]
+impl<T> Inode for T
+where
+    T: SimpleFile + Send + Sync + 'static,
+{
+    fn id(&self) -> InodeId {
+        self.id()
+    }
+
+    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let bytes = self.read().await?;
+        let end = usize::min(bytes.len().saturating_sub(offset as usize), buf.len());
+        if end == 0 {
+            return Ok(0);
+        }
+        let slice = &bytes[offset as usize..offset as usize + end];
+        buf[..end].copy_from_slice(slice);
+        Ok(end)
+    }
+
+    async fn getattr(&self) -> Result<FileAttr> {
+        self.getattr().await
+    }
+
+    async fn lookup(&self, _name: &str) -> Result<Arc<dyn Inode>> {
+        Err(FsError::NotADirectory.into())
+    }
+
+    async fn readdir(&self, _start_offset: u64) -> crate::error::Result<Box<dyn DirStream>> {
+        Err(FsError::NotADirectory.into())
+    }
+
+    async fn readlink(&self) -> Result<PathBuf> {
+        self.readlink().await
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A simple in-memory directory stream backed by a `Vec` of entries.
+pub struct SimpleDirStream {
+    entries: Vec<Dirent>,
+    idx: usize,
+}
+
+impl SimpleDirStream {
+    /// Creates a new `SimpleDirStream` starting at the given offset.
+    pub fn new(entries: Vec<Dirent>, start_offset: u64) -> Self {
+        Self {
+            entries,
+            idx: start_offset as usize,
+        }
+    }
+}
+
+#[async_trait]
+impl DirStream for SimpleDirStream {
+    async fn next_entry(&mut self) -> Result<Option<Dirent>> {
+        Ok(if let Some(entry) = self.entries.get(self.idx).cloned() {
+            self.idx += 1;
+            Some(entry)
+        } else {
+            None
+        })
     }
 }

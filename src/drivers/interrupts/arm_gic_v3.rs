@@ -16,10 +16,10 @@ use aarch64_cpu::registers::MPIDR_EL1;
 use alloc::{boxed::Box, sync::Arc};
 use core::arch::asm;
 use libkernel::{
-    KernAddressSpace, VirtualMemory,
     error::{KernelError, Result},
     memory::{
         address::{PA, VA},
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
         region::PhysMemoryRegion,
     },
 };
@@ -191,8 +191,8 @@ impl ArmGicV3 {
         let num_spis = (it_lines * 32).saturating_sub(32) as usize;
 
         // Set all SPIs to Group 1 (non-secure)
-        for i in 1..num_spis.div_ceil(32) {
-            dist.IGROUPR[i].set(0xFFFF_FFFF);
+        for reg in dist.IGROUPR.iter().take(num_spis.div_ceil(32)).skip(1) {
+            reg.set(0xFFFF_FFFF);
         }
 
         // Disable, clear pending, and set default priority for all SPIs
@@ -202,8 +202,8 @@ impl ArmGicV3 {
         }
 
         // Set all priorites to 0 (highest).
-        for i in 8..((num_spis + 31) / 4) {
-            dist.IPRIORITYR[i].set(0);
+        for reg in dist.IPRIORITYR.iter().take((num_spis + 31) / 4).skip(8) {
+            reg.set(0);
         }
 
         // EnableGrp1ns: Enable group 1Ns interrupts
@@ -233,10 +233,7 @@ impl ArmGicV3 {
         rdist.WAKER.set(rdist.WAKER.get() & !(1 << 1));
         while rdist.WAKER.get() & (1 << 2) != 0 {}
 
-        info!(
-            "GICv3: Redistributor for core {} (MPIDR=0x{:x}) is awake.",
-            core_id, mpidr
-        );
+        info!("GICv3: Redistributor for core {core_id} (MPIDR=0x{mpidr:x}) is awake.",);
 
         // 2. Configure PPIs and SGIs for this core SGIs (0-15) are Group 0,
         // PPIs (16-31) are Group 1
@@ -245,8 +242,8 @@ impl ArmGicV3 {
         sgi_ppi.ICPENDR0.set(0xFFFF_FFFF); // Clear all pending
 
         // Set default priorities
-        for i in 0..8 {
-            sgi_ppi.IPRIORITYR[i].set(0xA0A0_A0A0);
+        for reg in sgi_ppi.IPRIORITYR.iter().take(8) {
+            reg.set(0xA0A0_A0A0);
         }
 
         // 3. Enable the CPU's system register interface to the GIC
@@ -263,7 +260,7 @@ impl ArmGicV3 {
         // 5. Enable interrupt group 1 at the CPU interface
         set_icc_igrpen1_el1(1);
 
-        info!("GICv3: CPU interface for core {} enabled.", core_id);
+        info!("GICv3: CPU interface for core {core_id} enabled.");
         Ok(())
     }
 
@@ -272,7 +269,7 @@ impl ArmGicV3 {
         // This is a simplified search. A full implementation should parse the
         // GICR's TYPER to find the correct redistributor for a given MPIDR. For
         // systems where cores and redistributors are mapped linearly (like QEMU
-        // virt) this should be fine, but we do an assert just to be ensure.
+        // virt) this should be fine, but we do an assert just to ensure.
         let core_id = (mpidr & 0xFF) + ((mpidr >> 8) & 0xFF) * 4; // Simple linear core ID
         let rdist_offset = core_id as usize * self.rdist_stride;
         let rdist_addr = self.rdist_base.value() + rdist_offset;
@@ -401,7 +398,7 @@ impl InterruptController for ArmGicV3 {
 
     fn enable_core(&mut self, cpu_id: usize) {
         if let Err(e) = self.init_core(cpu_id) {
-            warn!("Failed to enable interrupts for core {}: {}", cpu_id, e);
+            warn!("Failed to enable interrupts for core {cpu_id}: {e}");
             return;
         }
 
@@ -411,6 +408,12 @@ impl InterruptController for ArmGicV3 {
                 trigger: TriggerMode::EdgeRising,
             });
         }
+
+        // Also enable the timer
+        self.enable_interrupt(InterruptConfig {
+            descriptor: InterruptDescriptor::Ppi(14),
+            trigger: TriggerMode::EdgeRising,
+        });
     }
 
     fn parse_fdt_interrupt_regs(
@@ -436,7 +439,7 @@ impl InterruptController for ArmGicV3 {
             0x4 => LevelHigh,
             // GICv3 simplified trigger types for SPIs. Level-low and falling-edge are less common.
             _ => {
-                warn!("Unsupported GIC interrupt trigger flag: {}", flags);
+                warn!("Unsupported GIC interrupt trigger flag: {flags}");
                 LevelHigh // Default to a safe value
             }
         };
@@ -482,14 +485,13 @@ pub fn gic_v3_probe(_dm: &mut DriverManager, d: DeviceDescriptor) -> Result<Arc<
             };
 
             info!(
-                "ARM GICv3 found: dist @ {:?}, rdist @ {:?} (stride=0x{:x})",
-                dist_region, rdist_region, rdist_stride
+                "ARM GICv3 found: dist @ {dist_region:?}, rdist @ {rdist_region:?} (stride=0x{rdist_stride:x})",
             );
 
             let mut gic = ArmGicV3::new(dist_mem, rdist_mem, rdist_stride)?;
 
             if let Err(e) = gic.init_core(0) {
-                panic!("Failed to initialize GICv3 for boot core: {:?}", e);
+                panic!("Failed to initialize GICv3 for boot core: {e:?}");
             }
 
             let gic = Arc::new(SpinLock::new(gic));

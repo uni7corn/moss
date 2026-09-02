@@ -1,114 +1,28 @@
-use core::marker::PhantomData;
+//! AArch64 page table structures, levels, and mapping logic.
 
-use super::{
-    pg_descriptors::{
-        L0Descriptor, L1Descriptor, L2Descriptor, L3Descriptor, MemoryType, PaMapper,
-        PageTableEntry, TableMapper,
-    },
-    tlb::TLBInvalidator,
-};
+use super::pg_descriptors::{L0Descriptor, L1Descriptor, L2Descriptor, L3Descriptor, MemoryType};
 use crate::{
     error::{MapError, Result},
     memory::{
         PAGE_SIZE,
         address::{TPA, TVA, VA},
-        permissions::PtePermissions,
+        paging::{
+            PaMapper, PageAllocator, PageTableEntry, PageTableMapper, PgTable, PgTableArray,
+            TLBInvalidator, TableMapper, TableMapperTable, permissions::PtePermissions,
+        },
         region::{PhysMemoryRegion, VirtMemoryRegion},
     },
 };
 
-pub const DESCRIPTORS_PER_PAGE: usize = PAGE_SIZE / core::mem::size_of::<u64>();
-pub const LEVEL_MASK: usize = DESCRIPTORS_PER_PAGE - 1;
-
-/// Trait representing a single level of the page table hierarchy.
-///
-/// Each implementor corresponds to a specific page table level (L0, L1, L2,
-/// L3), characterized by its `SHIFT` value which determines the bits of the
-/// virtual address used to index into the table.
-///
-/// # Associated Types
-/// - `Descriptor`: The type representing an individual page table entry (PTE) at this level.
-///
-/// # Constants
-/// - `SHIFT`: The bit position to shift the virtual address to obtain the index for this level.
-///
-/// # Provided Methods
-/// - `pg_index(va: VA) -> usize`: Calculate the index into the page table for the given virtual address.
-///
-/// # Required Methods
-/// - `get_desc(&self, va: VA) -> Self::Descriptor`: Retrieve the descriptor
-///   (PTE) for the given virtual address.
-/// - `get_desc_mut(&mut self, va: VA) -> &mut Self::Descriptor`: Get a mutable
-///   reference to the descriptor, allowing updates.
-pub trait PgTable: Clone + Copy {
-    /// Bit shift used to extract the index for this page table level.
-    const SHIFT: usize;
-
-    /// The descriptor (page table entry) type for this level.
-    type Descriptor: PageTableEntry;
-
-    fn from_ptr(ptr: TVA<PgTableArray<Self>>) -> Self;
-
-    fn to_raw_ptr(self) -> *mut u64;
-
-    /// Compute the index into this page table from a virtual address.
-    fn pg_index(va: VA) -> usize {
-        (va.value() >> Self::SHIFT) & LEVEL_MASK
-    }
-
-    /// Get the descriptor for a given virtual address.
-    fn get_desc(self, va: VA) -> Self::Descriptor;
-
-    /// Set the value of the descriptor for a particular VA.
-    fn set_desc(self, va: VA, desc: Self::Descriptor, invalidator: &dyn TLBInvalidator);
-}
-
-pub(super) trait TableMapperTable: PgTable<Descriptor: TableMapper> + Clone + Copy {
-    type NextLevel: PgTable;
-
-    /// Follows a descriptor to the next-level table if it's a valid table descriptor.
-    ///
-    /// This function is primarily used in tests to verify the integrity of the
-    /// page table hierarchy after a mapping operation. It is not used in the hot
-    /// path of `map_range` itself, so a `dead_code` warning is allowed.
-    #[allow(dead_code)]
-    fn next_table_pa(self, va: VA) -> Option<TPA<PgTableArray<Self::NextLevel>>> {
-        let desc = self.get_desc(va);
-        Some(TPA::from_value(desc.next_table_address()?.value()))
-    }
-}
-
-#[derive(Clone)]
-#[repr(C, align(4096))]
-pub struct PgTableArray<K: PgTable> {
-    pages: [u64; DESCRIPTORS_PER_PAGE],
-    _phantom: PhantomData<K>,
-}
-
-impl<K: PgTable> PgTableArray<K> {
-    pub const fn new() -> Self {
-        Self {
-            pages: [0; DESCRIPTORS_PER_PAGE],
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<K: PgTable> Default for PgTableArray<K> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 macro_rules! impl_pgtable {
-    ($table:ident, $shift:expr, $desc_type:ident) => {
+    ($(#[$outer:meta])* $table:ident, $desc_type:ident) => {
         #[derive(Clone, Copy)]
+        $(#[$outer])*
         pub struct $table {
             base: *mut u64,
         }
 
         impl PgTable for $table {
-            const SHIFT: usize = $shift;
             type Descriptor = $desc_type;
 
             fn from_ptr(ptr: TVA<PgTableArray<Self>>) -> Self {
@@ -121,9 +35,14 @@ macro_rules! impl_pgtable {
                 self.base
             }
 
-            fn get_desc(self, va: VA) -> Self::Descriptor {
-                let raw = unsafe { self.base.add(Self::pg_index(va)).read_volatile() };
+            fn get_idx(self, idx: usize) -> Self::Descriptor {
+                debug_assert!(idx < Self::DESCRIPTORS_PER_PAGE);
+                let raw = unsafe { self.base.add(idx).read_volatile() };
                 Self::Descriptor::from_raw(raw)
+            }
+
+            fn get_desc(self, va: VA) -> Self::Descriptor {
+                self.get_idx(Self::pg_index(va))
             }
 
             fn set_desc(self, va: VA, desc: Self::Descriptor, _invalidator: &dyn TLBInvalidator) {
@@ -137,70 +56,29 @@ macro_rules! impl_pgtable {
     };
 }
 
-impl_pgtable!(L0Table, 39, L0Descriptor);
-impl TableMapperTable for L0Table {
-    type NextLevel = L1Table;
-}
+impl_pgtable!(
+    /// Level 0 page table (512 GiB per entry).
+    L0Table,
+    L0Descriptor
+);
 
-impl_pgtable!(L1Table, 30, L1Descriptor);
-impl TableMapperTable for L1Table {
-    type NextLevel = L2Table;
-}
+impl_pgtable!(
+    /// Level 1 page table (1 GiB per entry).
+    L1Table,
+    L1Descriptor
+);
 
-impl_pgtable!(L2Table, 21, L2Descriptor);
-impl TableMapperTable for L2Table {
-    type NextLevel = L3Table;
-}
+impl_pgtable!(
+    /// Level 2 page table (2 MiB per entry).
+    L2Table,
+    L2Descriptor
+);
 
-impl_pgtable!(L3Table, 12, L3Descriptor);
-
-/// Trait for temporarily mapping and modifying a page table located at a
-/// physical address.
-///
-/// During early boot, there are multiple mechanisms for accessing page table memory:
-/// - Identity mapping (idmap): active very early when VA = PA
-/// - Fixmap: a small, reserved region of virtual memory used to map arbitrary
-///   PAs temporarily
-/// - Page-offset (linear map/logical map): when VA = PA + offset, typically
-///   used after MMU init
-///
-/// This trait abstracts over those mechanisms by providing a unified way to
-/// safely access and mutate a page table given its physical address.
-///
-/// # Safety
-/// This function is `unsafe` because the caller must ensure:
-/// - The given physical address `pa` is valid and correctly aligned for type `T`.
-/// - The contents at that physical address represent a valid page table of type `T`.
-pub trait PageTableMapper {
-    /// Map a physical address to a usable reference of the page table, run the
-    /// closure, and unmap.
-    ///
-    /// # Safety
-    /// This function is `unsafe` because the caller must ensure:
-    /// - The given physical address `pa` is valid and correctly aligned for type `T`.
-    /// - The contents at that physical address represent a valid page table of type `T`.
-    unsafe fn with_page_table<T: PgTable, R>(
-        &mut self,
-        pa: TPA<PgTableArray<T>>,
-        f: impl FnOnce(TVA<PgTableArray<T>>) -> R,
-    ) -> Result<R>;
-}
-
-/// Trait for allocating new page tables during address space setup.
-///
-/// The page table walker uses this allocator to request fresh page tables
-/// when needed (e.g., when creating new levels in the page table hierarchy).
-///
-/// # Responsibilities
-/// - Return a valid, zeroed (or otherwise ready) page table physical address wrapped in `TPA<T>`.
-/// - Ensure the allocated page table meets the alignment and size requirements of type `T`.
-pub trait PageAllocator {
-    /// Allocate a new page table of type `T` and return its physical address.
-    ///
-    /// # Errors
-    /// Returns an error if allocation fails (e.g., out of memory).
-    fn allocate_page_table<T: PgTable>(&mut self) -> Result<TPA<PgTableArray<T>>>;
-}
+impl_pgtable!(
+    /// Level 3 page table (4 KiB per entry).
+    L3Table,
+    L3Descriptor
+);
 
 /// Describes the attributes of a memory range to be mapped.
 pub struct MapAttributes {
@@ -210,8 +88,7 @@ pub struct MapAttributes {
     /// The target virtual memory region. Must be page-aligned and have the same
     /// size as `phys`.
     pub virt: VirtMemoryRegion,
-    /// The memory attributes (e.g., `MemoryType::Normal`, `MemoryType::Device`)
-    /// for the mapping.
+    /// The architecture-specific memory attributes for the mapping.
     pub mem_type: MemoryType,
     /// The access permissions (read/write/execute, user/kernel) for the
     /// mapping.
@@ -315,19 +192,19 @@ where
     PM: PageTableMapper,
 {
     if attrs.phys.size() != attrs.virt.size() {
-        Err(MapError::SizeMismatch)?
+        Err(MapError::SizeMismatch)?;
     }
 
     if attrs.phys.size() < PAGE_SIZE {
-        Err(MapError::TooSmall)?
+        Err(MapError::TooSmall)?;
     }
 
     if !attrs.phys.is_page_aligned() {
-        Err(MapError::PhysNotAligned)?
+        Err(MapError::PhysNotAligned)?;
     }
 
     if !attrs.virt.is_page_aligned() {
-        Err(MapError::VirtNotAligned)?
+        Err(MapError::VirtNotAligned)?;
     }
 
     while attrs.virt.size() > 0 {
@@ -365,7 +242,7 @@ fn try_map_pa<L, PA, PM>(
     ctx: &mut MappingContext<PA, PM>,
 ) -> Result<Option<usize>>
 where
-    L: PgTable<Descriptor: PaMapper>,
+    L: PgTable<Descriptor: PaMapper<MemoryType = MemoryType>>,
     PA: PageAllocator,
     PM: PageTableMapper,
 {
@@ -395,7 +272,7 @@ where
             })?;
         }
 
-        Ok(Some(1 << (L::Descriptor::map_shift() - 12)))
+        Ok(Some(1 << (L::Descriptor::MAP_SHIFT - 12)))
     } else {
         Ok(None)
     }
@@ -405,7 +282,7 @@ pub(super) fn map_at_level<L, PA, PM>(
     table: TPA<PgTableArray<L>>,
     va: VA,
     ctx: &mut MappingContext<PA, PM>,
-) -> Result<TPA<PgTableArray<L::NextLevel>>>
+) -> Result<TPA<PgTableArray<<L::Descriptor as TableMapper>::NextLevel>>>
 where
     L: TableMapperTable,
     PA: PageAllocator,
@@ -430,18 +307,20 @@ where
         }
 
         // The descriptor is invalid (zero). We can create a new table.
-        let new_pa = ctx.allocator.allocate_page_table::<L::NextLevel>()?;
+        let new_pa = ctx
+            .allocator
+            .allocate_page_table::<<L::Descriptor as TableMapper>::NextLevel>()?;
 
         // Zero out the new table before use.
         ctx.mapper.with_page_table(new_pa, |new_pgtable| {
-            core::ptr::write_bytes(new_pgtable.as_ptr_mut() as *mut _ as *mut u8, 0, PAGE_SIZE)
+            core::ptr::write_bytes(new_pgtable.as_ptr_mut() as *mut _ as *mut u8, 0, PAGE_SIZE);
         })?;
 
         // Set the descriptor at the current level to point to the new table.
         ctx.mapper.with_page_table(table, |pgtable| {
             L::from_ptr(pgtable).set_desc(
                 va,
-                L::Descriptor::new_next_table(new_pa.to_untyped()),
+                L::Descriptor::new_next_table(new_pa),
                 ctx.invalidator,
             );
         })?;
@@ -451,87 +330,26 @@ where
 }
 
 #[cfg(test)]
+#[allow(missing_docs)]
 pub mod tests {
     use super::*;
     use crate::{
-        arch::arm64::memory::pg_walk::{WalkContext, walk_and_modify_region},
+        arch::arm64::memory::pg_walk::walk_and_modify_region,
         error::KernelError,
-        memory::address::{IdentityTranslator, PA, VA},
+        memory::{
+            address::{PA, VA},
+            paging::test::{MockPageAllocator, PassthroughMapper},
+        },
     };
 
-    /// A mock TLB invalidator that does nothing for unit testing.
-    pub struct MockTLBInvalidator;
-    impl TLBInvalidator for MockTLBInvalidator {}
-
-    /// Mock page allocator that allocates on the host heap and uses a counter
-    /// to simulate memory limits.
-    pub struct MockPageAllocator {
-        pages_allocated: usize,
-        max_pages: usize,
+    pub struct Arm64PagingTestHarness {
+        pub inner: crate::memory::paging::test::TestHarness<L0Table>,
     }
 
-    impl MockPageAllocator {
-        fn new(max_pages: usize) -> Self {
+    impl Arm64PagingTestHarness {
+        pub fn new(num_pages: usize) -> Self {
             Self {
-                pages_allocated: 0,
-                max_pages,
-            }
-        }
-    }
-
-    impl PageAllocator for MockPageAllocator {
-        fn allocate_page_table<T: PgTable>(&mut self) -> Result<TPA<PgTableArray<T>>> {
-            if self.pages_allocated >= self.max_pages {
-                Err(KernelError::NoMemory)
-            } else {
-                self.pages_allocated += 1;
-                // Allocate a page-aligned table on the host heap.
-                let layout = std::alloc::Layout::new::<PgTableArray<L0Table>>();
-                let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-                if ptr.is_null() {
-                    panic!("Host failed to allocate memory for test");
-                }
-
-                // Return the raw pointer value as our "physical address".
-                Ok(TPA::from_value(ptr as usize))
-            }
-        }
-    }
-
-    /// A mock mapper for host-based testing. It assumes that the "physical
-    /// address" (TPA) is just a raw pointer from the host's virtual address
-    /// space, which is true for tests using heap allocation. It performs a
-    /// direct cast.
-    pub struct PassthroughMapper;
-
-    impl PageTableMapper for PassthroughMapper {
-        unsafe fn with_page_table<T: PgTable, R>(
-            &mut self,
-            pa: TPA<PgTableArray<T>>,
-            f: impl FnOnce(TVA<PgTableArray<T>>) -> R,
-        ) -> Result<R> {
-            // The "physical address" in our test is the raw pointer from the heap.
-            // Just cast it back and use it.
-            Ok(f(pa.to_va::<IdentityTranslator>()))
-        }
-    }
-
-    pub struct TestHarness {
-        allocator: MockPageAllocator,
-        pub mapper: PassthroughMapper,
-        pub invalidator: MockTLBInvalidator,
-        pub l0_table: TPA<PgTableArray<L0Table>>,
-    }
-
-    impl TestHarness {
-        pub fn new(max_pages: usize) -> Self {
-            let mut allocator = MockPageAllocator::new(max_pages);
-            let l0_table = allocator.allocate_page_table::<L0Table>().unwrap();
-            Self {
-                allocator,
-                mapper: PassthroughMapper,
-                invalidator: MockTLBInvalidator,
-                l0_table,
+                inner: crate::memory::paging::test::TestHarness::new(num_pages),
             }
         }
 
@@ -539,16 +357,9 @@ pub mod tests {
             &mut self,
         ) -> MappingContext<'_, MockPageAllocator, PassthroughMapper> {
             MappingContext {
-                allocator: &mut self.allocator,
-                mapper: &mut self.mapper,
-                invalidator: &self.invalidator,
-            }
-        }
-
-        pub fn create_walk_ctx(&mut self) -> WalkContext<'_, PassthroughMapper> {
-            WalkContext {
-                mapper: &mut self.mapper,
-                invalidator: &self.invalidator,
+                allocator: &mut self.inner.allocator,
+                mapper: &mut self.inner.mapper,
+                invalidator: &self.inner.invalidator,
             }
         }
 
@@ -562,7 +373,7 @@ pub mod tests {
         ) -> Result<()> {
             let size = num_pages * PAGE_SIZE;
             map_range(
-                self.l0_table,
+                self.inner.root_table,
                 MapAttributes {
                     phys: PhysMemoryRegion::new(PA::from_value(pa_start), size),
                     virt: VirtMemoryRegion::new(VA::from_value(va_start), size),
@@ -577,9 +388,9 @@ pub mod tests {
         pub fn verify_perms(&mut self, va: VA, expected_perms: PtePermissions) {
             let mut perms_found = None;
             walk_and_modify_region(
-                self.l0_table,
+                self.inner.root_table,
                 VirtMemoryRegion::new(va, PAGE_SIZE),
-                &mut self.create_walk_ctx(),
+                &mut self.inner.create_walk_ctx(),
                 &mut |_va, desc: L3Descriptor| {
                     perms_found = desc.permissions();
                     desc // Don't modify
@@ -589,6 +400,8 @@ pub mod tests {
             assert_eq!(perms_found, Some(expected_perms));
         }
     }
+
+    pub type TestHarness = Arm64PagingTestHarness;
 
     #[test]
     fn test_pg_index() {
@@ -634,7 +447,7 @@ pub mod tests {
         let virt = VirtMemoryRegion::new(VA::from_value(0x1_0000), PAGE_SIZE);
 
         map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys,
                 virt,
@@ -649,15 +462,18 @@ pub mod tests {
 
         // 1. Check L0 -> L1
         let l1_tpa = unsafe {
-            harness.mapper.with_page_table(harness.l0_table, |l0_tbl| {
-                L0Table::from_ptr(l0_tbl)
-                    .next_table_pa(va)
-                    .expect("L1 table should exist")
-            })?
+            harness
+                .inner
+                .mapper
+                .with_page_table(harness.inner.root_table, |l0_tbl| {
+                    L0Table::from_ptr(l0_tbl)
+                        .next_table_pa(va)
+                        .expect("L1 table should exist")
+                })?
         };
         // 2. Check L1 -> L2
         let l2_tpa = unsafe {
-            harness.mapper.with_page_table(l1_tpa, |l1_tbl| {
+            harness.inner.mapper.with_page_table(l1_tpa, |l1_tbl| {
                 L1Table::from_ptr(l1_tbl)
                     .next_table_pa(va)
                     .expect("L2 table should exist")
@@ -665,7 +481,7 @@ pub mod tests {
         };
         // 3. Check L2 -> L3
         let l3_tpa = unsafe {
-            harness.mapper.with_page_table(l2_tpa, |l2_tbl| {
+            harness.inner.mapper.with_page_table(l2_tpa, |l2_tbl| {
                 L2Table::from_ptr(l2_tbl)
                     .next_table_pa(va)
                     .expect("L3 table should exist")
@@ -674,6 +490,7 @@ pub mod tests {
         // 4. Check L3 descriptor
         let l3_desc = unsafe {
             harness
+                .inner
                 .mapper
                 .with_page_table(l3_tpa, |l3_tbl| L3Table::from_ptr(l3_tbl).get_desc(va))?
         };
@@ -705,23 +522,30 @@ pub mod tests {
             perms: PtePermissions::rx(true),
         };
 
-        map_range(harness.l0_table, attrs, &mut harness.create_map_ctx())?;
+        map_range(
+            harness.inner.root_table,
+            attrs,
+            &mut harness.create_map_ctx(),
+        )?;
 
         // Verification: Walk L0 -> L1, then check the L2 descriptor
         let va = virt.start_address();
 
         // L0 -> L1
         let l1_tpa = unsafe {
-            harness.mapper.with_page_table(harness.l0_table, |tbl| {
-                L0Table::from_ptr(tbl)
-                    .next_table_pa(va)
-                    .expect("L1 table should exist")
-            })?
+            harness
+                .inner
+                .mapper
+                .with_page_table(harness.inner.root_table, |tbl| {
+                    L0Table::from_ptr(tbl)
+                        .next_table_pa(va)
+                        .expect("L1 table should exist")
+                })?
         };
 
         // L1 -> L2
         let l2_tpa = unsafe {
-            harness.mapper.with_page_table(l1_tpa, |tbl| {
+            harness.inner.mapper.with_page_table(l1_tpa, |tbl| {
                 L1Table::from_ptr(tbl)
                     .next_table_pa(va)
                     .expect("L2 table should exist")
@@ -731,6 +555,7 @@ pub mod tests {
         // Check L2 Desc.
         let l2_desc = unsafe {
             harness
+                .inner
                 .mapper
                 .with_page_table(l2_tpa, |l2_tbl| L2Table::from_ptr(l2_tbl).get_desc(va))?
         };
@@ -744,7 +569,7 @@ pub mod tests {
         assert_eq!(l2_desc.mapped_address().unwrap(), phys.start_address());
 
         // Only L0, L1 and L2 tables should have been allocated.
-        assert_eq!(harness.allocator.pages_allocated, 3);
+        assert_eq!(harness.inner.allocator.pages_allocated, 3);
 
         Ok(())
     }
@@ -766,23 +591,31 @@ pub mod tests {
             perms: PtePermissions::rw(false),
         };
 
-        map_range(harness.l0_table, attrs, &mut harness.create_map_ctx())?;
+        map_range(
+            harness.inner.root_table,
+            attrs,
+            &mut harness.create_map_ctx(),
+        )?;
 
         let va1 = virt.start_address();
         let l1_tpa = unsafe {
-            harness.mapper.with_page_table(harness.l0_table, |tbl| {
-                L0Table::from_ptr(tbl).next_table_pa(va1).unwrap()
-            })?
+            harness
+                .inner
+                .mapper
+                .with_page_table(harness.inner.root_table, |tbl| {
+                    L0Table::from_ptr(tbl).next_table_pa(va1).unwrap()
+                })?
         };
 
         let l2_tpa = unsafe {
-            harness.mapper.with_page_table(l1_tpa, |tbl| {
+            harness.inner.mapper.with_page_table(l1_tpa, |tbl| {
                 L1Table::from_ptr(tbl).next_table_pa(va1).unwrap()
             })?
         };
 
         let l2_block_desc = unsafe {
             harness
+                .inner
                 .mapper
                 .with_page_table(l2_tpa, |tbl| L2Table::from_ptr(tbl).get_desc(va1))?
         };
@@ -796,17 +629,18 @@ pub mod tests {
 
         let va2 = VA::from_value(virt.start_address().value() + block_size);
         let l2_tpa = unsafe {
-            harness.mapper.with_page_table(l1_tpa, |tbl| {
+            harness.inner.mapper.with_page_table(l1_tpa, |tbl| {
                 L1Table::from_ptr(tbl).next_table_pa(va2).unwrap()
             })?
         };
         let l3_tpa = unsafe {
-            harness.mapper.with_page_table(l2_tpa, |tbl| {
+            harness.inner.mapper.with_page_table(l2_tpa, |tbl| {
                 L2Table::from_ptr(tbl).next_table_pa(va2).unwrap()
             })?
         };
         let l3_desc = unsafe {
             harness
+                .inner
                 .mapper
                 .with_page_table(l3_tpa, |tbl| L3Table::from_ptr(tbl).get_desc(va2))?
         };
@@ -840,7 +674,11 @@ pub mod tests {
             perms: PtePermissions::rw(true),
         };
 
-        map_range(harness.l0_table, attrs, &mut harness.create_map_ctx())?;
+        map_range(
+            harness.inner.root_table,
+            attrs,
+            &mut harness.create_map_ctx(),
+        )?;
 
         // Confirm 512 L3 mappings exist
         for i in 0..num_pages {
@@ -848,23 +686,27 @@ pub mod tests {
             let pa = PA::from_value(phys.start_address().value() + i * PAGE_SIZE);
 
             let l1_tpa = unsafe {
-                harness.mapper.with_page_table(harness.l0_table, |tbl| {
-                    L0Table::from_ptr(tbl).next_table_pa(va).unwrap()
-                })?
+                harness
+                    .inner
+                    .mapper
+                    .with_page_table(harness.inner.root_table, |tbl| {
+                        L0Table::from_ptr(tbl).next_table_pa(va).unwrap()
+                    })?
             };
             let l2_tpa = unsafe {
-                harness.mapper.with_page_table(l1_tpa, |tbl| {
+                harness.inner.mapper.with_page_table(l1_tpa, |tbl| {
                     L1Table::from_ptr(tbl).next_table_pa(va).unwrap()
                 })?
             };
             let l3_tpa = unsafe {
-                harness.mapper.with_page_table(l2_tpa, |tbl| {
+                harness.inner.mapper.with_page_table(l2_tpa, |tbl| {
                     L2Table::from_ptr(tbl).next_table_pa(va).unwrap()
                 })?
             };
 
             let desc = unsafe {
                 harness
+                    .inner
                     .mapper
                     .with_page_table(l3_tpa, |tbl| L3Table::from_ptr(tbl).get_desc(va))?
             };
@@ -888,10 +730,14 @@ pub mod tests {
             perms: PtePermissions::rw(true),
         };
 
-        let result = map_range(harness.l0_table, attrs, &mut harness.create_map_ctx());
+        let result = map_range(
+            harness.inner.root_table,
+            attrs,
+            &mut harness.create_map_ctx(),
+        );
 
         assert!(matches!(result, Err(KernelError::NoMemory)));
-        assert_eq!(harness.allocator.pages_allocated, 2); // L0 and L1 were allocated, failed on L2
+        assert_eq!(harness.inner.allocator.pages_allocated, 2); // L0 and L1 were allocated, failed on L2
     }
 
     #[test]
@@ -910,7 +756,11 @@ pub mod tests {
         };
 
         assert!(matches!(
-            map_range(harness.l0_table, attrs, &mut harness.create_map_ctx()),
+            map_range(
+                harness.inner.root_table,
+                attrs,
+                &mut harness.create_map_ctx()
+            ),
             Err(KernelError::MappingError(MapError::PhysNotAligned))
         ));
 
@@ -926,7 +776,11 @@ pub mod tests {
         };
 
         assert!(matches!(
-            map_range(harness.l0_table, attrs, &mut harness.create_map_ctx()),
+            map_range(
+                harness.inner.root_table,
+                attrs,
+                &mut harness.create_map_ctx()
+            ),
             Err(KernelError::MappingError(MapError::VirtNotAligned))
         ));
     }
@@ -946,7 +800,11 @@ pub mod tests {
         };
 
         assert!(matches!(
-            map_range(harness.l0_table, attrs, &mut harness.create_map_ctx()),
+            map_range(
+                harness.inner.root_table,
+                attrs,
+                &mut harness.create_map_ctx()
+            ),
             Err(KernelError::MappingError(MapError::SizeMismatch))
         ));
     }
@@ -961,7 +819,7 @@ pub mod tests {
 
         // First mapping should succeed.
         map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: pa1,
                 virt,
@@ -973,7 +831,7 @@ pub mod tests {
 
         // Attempting to map the same VA again should fail.
         let result = map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: pa2,
                 virt,
@@ -1003,7 +861,7 @@ pub mod tests {
         let virt_block = VirtMemoryRegion::new(block_va, block_size);
 
         map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: phys_block,
                 virt: virt_block,
@@ -1018,7 +876,7 @@ pub mod tests {
         let virt_page = VirtMemoryRegion::new(block_va.add_pages(1), PAGE_SIZE);
 
         let result = map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: phys_page,
                 virt: virt_page,
@@ -1050,7 +908,7 @@ pub mod tests {
         let virt_page = VirtMemoryRegion::new(block_va, PAGE_SIZE);
 
         map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: phys_page,
                 virt: virt_page,
@@ -1065,7 +923,7 @@ pub mod tests {
         let virt_block = VirtMemoryRegion::new(block_va, block_size);
 
         let result = map_range(
-            harness.l0_table,
+            harness.inner.root_table,
             MapAttributes {
                 phys: phys_block,
                 virt: virt_block,

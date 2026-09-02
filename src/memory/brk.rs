@@ -2,7 +2,7 @@ use core::convert::Infallible;
 
 use libkernel::memory::address::VA;
 
-use crate::sched::current_task;
+use crate::sched::syscall_ctx::ProcessCtx;
 
 /// Handles the `brk` system call.
 ///
@@ -19,14 +19,14 @@ use crate::sched::current_task;
 /// - If `addr` is 0, it returns the current break.
 /// - On a successful resize, it returns the new break.
 /// - On a failed resize, it returns the current, unchanged break.
-pub async fn sys_brk(addr: VA) -> Result<usize, Infallible> {
-    let task = current_task();
-    let mut vm = task.vm.lock_save_irq();
+pub async fn sys_brk(ctx: &ProcessCtx, addr: VA) -> Result<usize, Infallible> {
+    let proc_vm = ctx.shared().vm.shared_vm();
+    let mut vm = proc_vm.lock_save_irq();
 
     // The query case `brk(0)` is special and is handled separately from modifications.
     if addr.is_null() {
         let current_brk_val = vm.current_brk().value();
-        return Ok(current_brk_val as usize);
+        return Ok(current_brk_val);
     }
 
     // For non-null addresses, attempt to resize the break.
@@ -39,7 +39,7 @@ pub async fn sys_brk(addr: VA) -> Result<usize, Infallible> {
         // The contract is to return the current, unchanged break address.
         Err(_) => {
             let current_brk_val = vm.current_brk().value();
-            Ok(current_brk_val as usize)
+            Ok(current_brk_val)
         }
     }
 }

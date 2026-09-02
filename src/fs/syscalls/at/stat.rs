@@ -1,12 +1,12 @@
 use crate::{
-    current_task,
     fs::syscalls::at::{resolve_at_start_node, resolve_path_flags},
     memory::uaccess::{UserCopyable, copy_to_user, cstr::UserCStr},
     process::fd_table::Fd,
+    sched::syscall_ctx::ProcessCtx,
 };
 use core::ffi::c_char;
 use libkernel::{
-    error::Result,
+    error::{KernelError, Result},
     fs::{attr::FileAttr, path::Path},
     memory::address::TUA,
 };
@@ -45,7 +45,7 @@ impl From<FileAttr> for Stat {
         Self {
             st_dev: value.id.fs_id(),
             st_ino: value.id.inode_id(),
-            st_mode: value.mode.bits() as u32 | u32::from(value.file_type),
+            st_mode: value.mode().bits() as u32 | u32::from(value.file_type),
             st_nlink: value.nlinks,
             st_uid: value.uid.into(),
             st_gid: value.gid.into(),
@@ -68,6 +68,7 @@ impl From<FileAttr> for Stat {
 }
 
 pub async fn sys_newfstatat(
+    ctx: &ProcessCtx,
     dirfd: Fd,
     path: TUA<c_char>,
     statbuf: TUA<Stat>,
@@ -75,12 +76,16 @@ pub async fn sys_newfstatat(
 ) -> Result<usize> {
     let mut buf = [0; 1024];
 
-    let task = current_task();
+    let task = ctx.shared().clone();
     let flags = AtFlags::from_bits_truncate(flags);
     let path = Path::new(UserCStr::from_ptr(path).copy_from_user(&mut buf).await?);
 
-    let start_node = resolve_at_start_node(dirfd, path).await?;
-    let node = resolve_path_flags(dirfd, path, start_node, task.clone(), flags).await?;
+    let start_node = match resolve_at_start_node(ctx, dirfd, path, flags).await {
+        Ok(node) => node,
+        Err(err) if err != KernelError::NotSupported => panic!("{err}"),
+        Err(err) => return Err(err),
+    };
+    let node = resolve_path_flags(dirfd, path, start_node, &task, flags).await?;
 
     let attr = node.getattr().await?;
 

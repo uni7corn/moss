@@ -2,14 +2,19 @@ use aarch64_cpu::{
     asm::wfi,
     registers::{DAIF, MPIDR_EL1, ReadWriteable, Readable},
 };
+use alloc::string::String;
 use alloc::sync::Arc;
 use cpu_ops::{local_irq_restore, local_irq_save};
 use exceptions::ExceptionState;
 use libkernel::{
-    CpuOps, VirtualMemory,
-    arch::arm64::memory::pg_tables::{L0Table, PgTableArray},
+    CpuOps,
+    arch::arm64::memory::pg_tables::L0Table,
     error::Result,
-    memory::address::{UA, VA},
+    memory::{
+        address::{UA, VA},
+        paging::PgTableArray,
+        proc_vm::address_space::VirtualMemory,
+    },
 };
 use memory::{
     PAGE_OFFSET,
@@ -17,12 +22,15 @@ use memory::{
     mmu::{Arm64KernelAddressSpace, KERN_ADDR_SPC},
     uaccess::{Arm64CopyFromUser, Arm64CopyStrnFromUser, Arm64CopyToUser, try_copy_from_user},
 };
+use ptrace::Arm64PtraceGPRegs;
 
 use crate::{
     process::{
         Task,
+        owned::OwnedTask,
         thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
     },
+    sched::syscall_ctx::ProcessCtx,
     sync::SpinLock,
 };
 
@@ -35,9 +43,13 @@ mod fdt;
 mod memory;
 mod proc;
 pub mod psci;
+pub mod ptrace;
 
 pub struct Aarch64 {}
+
 impl CpuOps for Aarch64 {
+    type InterruptFlags = u64;
+
     fn id() -> usize {
         MPIDR_EL1.read(MPIDR_EL1::Aff0) as _
     }
@@ -48,11 +60,11 @@ impl CpuOps for Aarch64 {
         }
     }
 
-    fn disable_interrupts() -> usize {
+    fn disable_interrupts() -> Self::InterruptFlags {
         local_irq_save()
     }
 
-    fn restore_interrupt_state(state: usize) {
+    fn restore_interrupt_state(state: Self::InterruptFlags) {
         local_irq_restore(state);
     }
 
@@ -66,8 +78,6 @@ impl VirtualMemory for Aarch64 {
     type ProcessAddressSpace = Arm64ProcessAddressSpace;
     type KernelAddressSpace = Arm64KernelAddressSpace;
 
-    const PAGE_OFFSET: usize = PAGE_OFFSET;
-
     fn kern_address_space() -> &'static SpinLock<Self::KernelAddressSpace> {
         KERN_ADDR_SPC.get().unwrap()
     }
@@ -75,6 +85,9 @@ impl VirtualMemory for Aarch64 {
 
 impl Arch for Aarch64 {
     type UserContext = ExceptionState;
+    type PTraceGpRegs = Arm64PtraceGPRegs;
+
+    const PAGE_OFFSET: usize = PAGE_OFFSET;
 
     fn new_user_context(entry_point: VA, stack_top: VA) -> Self::UserContext {
         ExceptionState {
@@ -90,22 +103,29 @@ impl Arch for Aarch64 {
         "aarch64"
     }
 
+    fn cpu_count() -> usize {
+        boot::secondary::cpu_count()
+    }
+
     fn do_signal(
+        ctx: ProcessCtx,
         sig: SigId,
         action: UserspaceSigAction,
     ) -> impl Future<Output = Result<<Self as Arch>::UserContext>> {
-        proc::signal::do_signal(sig, action)
+        proc::signal::do_signal(ctx, sig, action)
     }
 
-    fn do_signal_return() -> impl Future<Output = Result<<Self as Arch>::UserContext>> {
-        proc::signal::do_signal_return()
+    fn do_signal_return(
+        ctx: ProcessCtx,
+    ) -> impl Future<Output = Result<<Self as Arch>::UserContext>> {
+        proc::signal::do_signal_return(ctx)
     }
 
     fn context_switch(new: Arc<Task>) {
         proc::context_switch(new);
     }
 
-    fn create_idle_task() -> Task {
+    fn create_idle_task() -> OwnedTask {
         proc::idle::create_idle_task()
     }
 
@@ -129,6 +149,10 @@ impl Arch for Aarch64 {
 
         // Fallback: halt the CPU indefinitely.
         Self::halt()
+    }
+
+    fn get_cmdline() -> Option<String> {
+        fdt::get_cmdline()
     }
 
     unsafe fn copy_from_user(

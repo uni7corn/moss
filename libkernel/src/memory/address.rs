@@ -1,4 +1,4 @@
-//! `address` module: Type-safe handling of virtual and physical addresses.
+//! Type-safe handling of virtual and physical addresses.
 //!
 //! This module defines strongly-typed address representations for both physical
 //! and virtual memory. It provides abstractions to ensure correct usage and
@@ -57,16 +57,28 @@ pub struct Virtual;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Physical;
 
+/// Marker for a virtual guest memory address type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuestVirtual;
+
+/// Marker for a physical guest memory address type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GuestPhysical;
+
 /// Marker for user memory address type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct User;
 
 impl sealed::Sealed for Virtual {}
 impl sealed::Sealed for Physical {}
+impl sealed::Sealed for GuestVirtual {}
+impl sealed::Sealed for GuestPhysical {}
 impl sealed::Sealed for User {}
 
 impl MemKind for Virtual {}
 impl MemKind for Physical {}
+impl MemKind for GuestVirtual {}
+impl MemKind for GuestPhysical {}
 impl MemKind for User {}
 
 /// A memory address with a kind (`Virtual`, `Physical`, or `User`) and an
@@ -104,6 +116,17 @@ impl<K: MemKind, T> Address<K, T> {
             _phantom: PhantomData,
             _phantom_type: PhantomData,
         }
+    }
+
+    /// Cast from one address space kind to the other, without modification of
+    /// the address bits.
+    ///
+    /// # Safety
+    ///
+    /// the caller must ensure that the same address is valid in the other
+    /// address space, e.g. through identity mappings.
+    pub const unsafe fn cast_mem_kind<O: MemKind>(self) -> Address<O, T> {
+        Address::from_value(self.value())
     }
 
     /// Return the underlying raw address value.
@@ -147,20 +170,24 @@ impl<K: MemKind, T> Address<K, T> {
         self.inner & PAGE_MASK
     }
 
+    /// Returns the null (zero) address.
     pub const fn null() -> Self {
         Self::from_value(0)
     }
 
+    /// Returns a new address offset forward by `n` bytes.
     #[must_use]
-    pub fn add_bytes(self, n: usize) -> Self {
+    pub const fn add_bytes(self, n: usize) -> Self {
         Self::from_value(self.value() + n)
     }
 
+    /// Returns a new address offset backward by `n` bytes.
     #[must_use]
     pub fn sub_bytes(self, n: usize) -> Self {
         Self::from_value(self.value() - n)
     }
 
+    /// Returns `true` if this is the null (zero) address.
     pub fn is_null(self) -> bool {
         self.inner == 0
     }
@@ -185,6 +212,12 @@ pub type TPA<T> = Address<Physical, T>;
 pub type TVA<T> = Address<Virtual, T>;
 /// A typed user address.
 pub type TUA<T> = Address<User, T>;
+/// A typed guest physical address.
+pub type TGPA<T> = Address<GuestPhysical, T>;
+/// A typed guest virtual address.
+pub type TGVA<T> = Address<GuestVirtual, T>;
+/// A typed host physical address.
+pub type THPA<T> = TPA<T>;
 
 /// An untyped physical address.
 pub type PA = Address<Physical, ()>;
@@ -192,6 +225,12 @@ pub type PA = Address<Physical, ()>;
 pub type VA = Address<Virtual, ()>;
 /// An untyped user address.
 pub type UA = Address<User, ()>;
+/// An untyped guest physical address.
+pub type GPA = Address<GuestPhysical, ()>;
+/// An untyped guest virtual address.
+pub type GVA = Address<GuestVirtual, ()>;
+/// An untyped host physical address.
+pub type HPA = PA;
 
 impl<T> TPA<T> {
     /// Convert to a raw const pointer.
@@ -218,6 +257,20 @@ impl<T> TPA<T> {
     /// Convert to a virtual address using a translator.
     pub fn to_va<A: AddressTranslator<T>>(self) -> TVA<T> {
         A::phys_to_virt(self)
+    }
+}
+
+impl<T> TGPA<T> {
+    /// Convert to an untyped guest physical address.
+    pub fn to_untyped(self) -> GPA {
+        GPA::from_value(self.value())
+    }
+}
+
+impl<T> TGVA<T> {
+    /// Convert to an untyped guest virtual address.
+    pub fn to_untyped(self) -> GVA {
+        GVA::from_value(self.value())
     }
 }
 
@@ -291,6 +344,7 @@ impl PA {
         TPA::from_value(self.value())
     }
 
+    /// Converts this physical address to a page frame number.
     pub fn to_pfn(&self) -> PageFrame {
         PageFrame::from_pfn(self.inner >> PAGE_SHIFT)
     }
@@ -298,7 +352,9 @@ impl PA {
 
 /// Trait for translating between physical and virtual addresses.
 pub trait AddressTranslator<T>: 'static + Send + Sync {
+    /// Translates a virtual address to its corresponding physical address.
     fn virt_to_phys(va: TVA<T>) -> TPA<T>;
+    /// Translates a physical address to its corresponding virtual address.
     fn phys_to_virt(pa: TPA<T>) -> TVA<T>;
 }
 

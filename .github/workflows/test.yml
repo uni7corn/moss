@@ -1,0 +1,92 @@
+name: Test
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        smp-feature: [ "", "smp" ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-aarch64 wget jq e2fsprogs
+      - name: Install arm toolchain
+        run: |
+          ./scripts/download-arm-toolchain.sh /tmp/arm-toolchain.tar.xz
+          mkdir -p /opt/arm-toolchain
+          tar -xf /tmp/arm-toolchain.tar.xz -C /opt/arm-toolchain --strip-components=1
+          rm /tmp/arm-toolchain.tar.xz
+      - name: Update PATH for arm toolchain
+        run: echo "/opt/arm-toolchain/bin:$PATH" >> $GITHUB_PATH
+      - name: Create Image
+        run: ./scripts/create-image.sh
+      # If all features are disabled
+      - name: Run tests
+        if: ${{ matrix.smp-feature == '' }}
+        run: |
+          cargo run -r --no-default-features -- --init /bin/usertest >> usertest.log
+          cargo test -r --no-default-features >> unittest.log
+      # If any feature is enabled
+      - name: Run tests
+        if: ${{ matrix.smp-feature == 'smp' }}
+        run: |
+          cargo run -r --no-default-features --features "${{ matrix.smp-feature }}" -- --init /bin/usertest >> usertest.log
+          cargo test -r --no-default-features --features "${{ matrix.smp-feature }}" >> unittest.log
+      - name: Display usertest output
+        run: cat usertest.log
+      - name: Display unit test output
+        run: cat unittest.log
+      - name: Check for usertest success line
+        run: grep -q "All tests passed in " usertest.log || (echo "Usertests failed" && exit 1)
+      - name: Check for unit test success line
+        run: |
+          grep -q "test result: .*ok.*\..*passed" unittest.log || (echo "Unit tests failed" && exit 1)
+      - name: Upload usertest output as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: usertest-output-${{ matrix.smp-feature || 'up' }}
+          path: usertest.log
+      - name: Upload unittest output as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: unittest-output-${{ matrix.smp-feature || 'up' }}
+          path: unittest.log
+  upload-image:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-aarch64 wget jq e2fsprogs
+      - name: Install arm toolchain
+        run: |
+          ./scripts/download-arm-toolchain.sh /tmp/arm-toolchain.tar.xz
+          mkdir -p /opt/arm-toolchain
+          tar -xf /tmp/arm-toolchain.tar.xz -C /opt/arm-toolchain --strip-components=1
+          rm /tmp/arm-toolchain.tar.xz
+      - name: Update PATH for arm toolchain
+        run: echo "/opt/arm-toolchain/bin:$PATH" >> $GITHUB_PATH
+      - name: Create Image
+        run: ./scripts/create-image.sh
+      - name: Upload image as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: moss.img
+          path: moss.img

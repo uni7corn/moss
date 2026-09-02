@@ -1,3 +1,8 @@
+//! Maps [`KernelError`] variants to POSIX `errno` values
+//! for returning results to user-space system calls.
+
+#![allow(missing_docs)]
+
 use crate::error::FsError;
 
 use super::KernelError;
@@ -37,7 +42,12 @@ pub const EPIPE: isize = -32;
 pub const EDOM: isize = -33;
 pub const ERANGE: isize = -34;
 pub const EWOULDBLOCK: isize = -EAGAIN;
+pub const ENAMETOOLONG: isize = -36;
 pub const ENOSYS: isize = -38;
+pub const ENOTEMPTY: isize = -39;
+pub const ELOOP: isize = -40;
+pub const EAFNOSUPPORT: isize = -97;
+pub const EOPNOTSUPP: isize = -95;
 pub const ETIMEDOUT: isize = -110;
 
 pub fn kern_err_to_syscall(err: KernelError) -> isize {
@@ -47,12 +57,31 @@ pub fn kern_err_to_syscall(err: KernelError) -> isize {
         KernelError::Fault => EFAULT,
         KernelError::TryAgain => EAGAIN,
         KernelError::BrokenPipe => EPIPE,
+        KernelError::InUse => EBUSY,
+        KernelError::NotPermitted => EPERM,
+        KernelError::BufferFull | KernelError::NameTooLong => ENAMETOOLONG,
         KernelError::Fs(FsError::NotFound) => ENOENT,
+        KernelError::Fs(FsError::IsADirectory) => EISDIR,
+        KernelError::Fs(FsError::NotADirectory) => ENOTDIR,
+        KernelError::Fs(FsError::AlreadyExists) => EEXIST,
+        KernelError::Fs(FsError::DirectoryNotEmpty) => ENOTEMPTY,
+        KernelError::Fs(FsError::Busy) => EBUSY,
+        KernelError::Fs(FsError::InvalidInput) => EINVAL, // TODO: Is this right?
+        KernelError::Fs(FsError::PermissionDenied) => EACCES,
+        KernelError::Fs(FsError::TooManyFiles) => EMFILE,
+        KernelError::Fs(FsError::NoDevice) => ENODEV,
+        KernelError::Fs(FsError::Loop) => ELOOP,
         KernelError::NotATty => ENOTTY,
         KernelError::SeekPipe => ESPIPE,
         KernelError::NotSupported => ENOSYS,
         KernelError::NoMemory => ENOMEM,
         KernelError::TimedOut => ETIMEDOUT,
+        KernelError::RangeError => ERANGE,
+        KernelError::NoChildProcess => ECHILD,
+        KernelError::OpNotSupported => EOPNOTSUPP,
+        KernelError::Interrupted => EINTR,
+        KernelError::NoProcess => ESRCH,
+        KernelError::AddressFamilyNotSupported => EAFNOSUPPORT,
         e => todo!("{e}"),
     }
 }

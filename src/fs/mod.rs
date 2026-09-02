@@ -1,24 +1,31 @@
-use alloc::borrow::ToOwned;
-use alloc::boxed::Box;
-use alloc::string::String;
-use alloc::{collections::btree_map::BTreeMap, sync::Arc};
+use crate::clock::realtime::date;
+use crate::{
+    drivers::{DM, Driver},
+    process::{
+        Task,
+        inotify::{notify_create, notify_delete, notify_delete_self, notify_modify, notify_move},
+    },
+    sync::SpinLock,
+};
+use alloc::{borrow::ToOwned, boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
 use async_trait::async_trait;
+use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
 use dir::DirFile;
-use libkernel::error::{FsError, KernelError, Result};
-use libkernel::fs::attr::FilePermissions;
-use libkernel::fs::path::Path;
-use libkernel::fs::{BlockDevice, FS_ID_START, FileType, Filesystem, Inode, InodeId, OpenFlags};
+use libkernel::{
+    error::{FsError, KernelError, Result},
+    fs::{
+        BlockDevice, FS_ID_START, FileType, Filesystem, Inode, InodeId, OpenFlags,
+        attr::FilePermissions, path::Path,
+    },
+    proc::caps::CapabilitiesFlags,
+};
 use open_file::OpenFile;
 use reg::RegFile;
 
-use crate::drivers::{DM, Driver};
-use crate::process::Task;
-use crate::sync::SpinLock;
-use alloc::vec::Vec;
-
 pub mod dir;
 pub mod fops;
+pub mod memfd;
 pub mod open_file;
 pub mod pipe;
 pub mod reg;
@@ -32,6 +39,10 @@ pub struct DummyInode {}
 impl Inode for DummyInode {
     fn id(&self) -> InodeId {
         InodeId::dummy()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -76,6 +87,13 @@ impl VfsState {
     fn add_mount(&mut self, mount_point_id: InodeId, mount: Mount) {
         self.filesystems.insert(mount.fs.id(), mount.fs.clone());
         self.mounts.insert(mount_point_id, mount);
+    }
+
+    /// Removes a mount point by its inode ID.
+    fn remove_mount(&mut self, mount_point_id: &InodeId) -> Option<()> {
+        let mount = self.mounts.remove(mount_point_id)?;
+        self.filesystems.remove(&mount.fs.id())?;
+        Some(())
     }
 
     /// Checks if an inode is a mount point and returns the root inode of the
@@ -176,13 +194,33 @@ impl VFS {
         Ok(())
     }
 
+    #[expect(unused)]
+    pub async fn unmount(&self, mount_point: Arc<dyn Inode>) -> Result<()> {
+        let mount_point_id = mount_point.id();
+
+        // Lock the state and remove the mount.
+        self.state
+            .lock_save_irq()
+            .remove_mount(&mount_point_id)
+            .ok_or(FsError::NotFound)?;
+
+        Ok(())
+    }
+
+    pub async fn get_fs(&self, inode: Arc<dyn Inode>) -> Result<Arc<dyn Filesystem>> {
+        self.state
+            .lock_save_irq()
+            .get_fs(inode.id())
+            .ok_or(KernelError::from(FsError::NoDevice))
+    }
+
     /// Resolves a path string to an Inode, starting from a given root for
     /// relative paths.
     pub async fn resolve_path(
         &self,
         path: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<dyn Inode>> {
         let root = if path.is_absolute() {
             task.root.lock_save_irq().0.clone() // use the task's root inode, in case a custom chroot was set
@@ -199,7 +237,7 @@ impl VFS {
         &self,
         path: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<dyn Inode>> {
         let root = if path.is_absolute() {
             task.root.lock_save_irq().0.clone()
@@ -255,29 +293,32 @@ impl VFS {
 
             let next_inode = current_inode.lookup(&component).await?;
 
-            let resolved_inode = if let Some(mount_root) =
-                self.state.lock_save_irq().get_mount_root(&next_inode.id())
-            {
-                mount_root
-            } else {
-                next_inode
-            };
+            let attr = next_inode.getattr().await?;
 
-            if let Some(new_inode) = self
-                .resolve_symlink(resolved_inode, &mut components, follow_last_sym)
-                .await?
-            {
+            if attr.file_type == FileType::Symlink && (follow_last_sym || !components.is_empty()) {
                 symlink_count += 1;
                 if symlink_count > MAX_SYMLINK {
                     return Err(FsError::Loop.into()); // prevent infinite looping
                 }
 
-                current_inode = new_inode;
+                let target = next_inode.readlink().await?;
+                let mut new_components: Vec<_> =
+                    target.components().map(|s| s.to_owned()).collect();
+                new_components.reverse();
+                for comp in new_components {
+                    components.push(comp);
+                }
+
+                if target.is_absolute() {
+                    // if absolute, restart from root
+                    current_inode = self.root_inode.lock_save_irq().as_ref().unwrap().clone();
+                }
+
                 continue;
             }
 
             // Delegate the lookup to the underlying filesystem.
-            current_inode = current_inode.lookup(&component).await?;
+            current_inode = next_inode;
         }
 
         // After the final lookup, check if the destination is itself a mount point.
@@ -292,35 +333,6 @@ impl VFS {
         Ok(current_inode)
     }
 
-    async fn resolve_symlink(
-        &self,
-        inode: Arc<dyn Inode>,
-        components: &mut Vec<String>,
-        follow_last: bool,
-    ) -> Result<Option<Arc<dyn Inode>>> {
-        let attr = inode.getattr().await?;
-        if attr.file_type != FileType::Symlink {
-            return Ok(None);
-        }
-
-        if !follow_last && components.is_empty() {
-            return Ok(None);
-        }
-
-        let target = inode.readlink().await?;
-        let mut new_components: Vec<_> = target.components().map(|s| s.to_owned()).collect();
-        new_components.reverse();
-        for comp in new_components {
-            components.push(comp);
-        }
-        Ok(Some(if target.is_absolute() {
-            // if absolute, restart from root
-            self.root_inode.lock_save_irq().as_ref().unwrap().clone()
-        } else {
-            inode
-        }))
-    }
-
     /// Returns a clone of the root inode.
     pub fn root_inode(&self) -> Arc<dyn Inode> {
         self.root_inode.lock_save_irq().as_ref().unwrap().clone()
@@ -332,10 +344,10 @@ impl VFS {
         flags: OpenFlags,
         root: Arc<dyn Inode>,
         mode: FilePermissions,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<Arc<OpenFile>> {
         // Attempt to resolve the full path first.
-        let resolve_result = self.resolve_path(path, root.clone(), task.clone()).await;
+        let resolve_result = self.resolve_path(path, root.clone(), task).await;
 
         let target_inode = match resolve_result {
             // The file/directory exists.
@@ -369,7 +381,11 @@ impl VFS {
                         return Err(FsError::NotADirectory.into());
                     }
 
-                    parent_inode.create(file_name, FileType::File, mode).await?
+                    let target_inode = parent_inode
+                        .create(file_name, FileType::File, mode, Some(date()))
+                        .await?;
+                    notify_create(parent_inode.id(), file_name, false).await;
+                    target_inode
                 } else {
                     // O_CREAT was not specified, so NotFound is the correct error.
                     return Err(FsError::NotFound.into());
@@ -399,6 +415,7 @@ impl VFS {
         {
             // TODO: Check for write permissions on the inode itself.
             target_inode.truncate(0).await?;
+            notify_modify(target_inode.id()).await;
         }
 
         match attr.file_type {
@@ -424,10 +441,16 @@ impl VFS {
                     .find_char_driver(char_dev_descriptor.major)
                     .ok_or(FsError::NoDevice)?;
 
-                Ok(char_driver
+                let mut open_file = char_driver
                     .get_device(char_dev_descriptor.minor)
                     .ok_or(FsError::NoDevice)?
-                    .open(flags)?)
+                    .open(flags)?;
+
+                if let Some(of) = Arc::get_mut(&mut open_file) {
+                    of.update(target_inode, path.to_owned());
+                }
+
+                Ok(open_file)
             }
             FileType::Fifo => todo!(),
             FileType::Socket => todo!(),
@@ -439,10 +462,10 @@ impl VFS {
         path: &Path,
         root: Arc<dyn Inode>,
         mode: FilePermissions,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
         // Try to resolve the target directory first.
-        match self.resolve_path(path, root.clone(), task.clone()).await {
+        match self.resolve_path(path, root.clone(), task).await {
             // The path already exists, this is an error.
             Ok(_) => Err(FsError::AlreadyExists.into()),
 
@@ -467,8 +490,9 @@ impl VFS {
 
                 // Delegate the creation to the filesystem-specific inode.
                 parent_inode
-                    .create(dir_name, FileType::Directory, mode)
+                    .create(dir_name, FileType::Directory, mode, Some(date()))
                     .await?;
+                notify_create(parent_inode.id(), dir_name, true).await;
 
                 Ok(())
             }
@@ -483,12 +507,10 @@ impl VFS {
         path: &Path,
         root: Arc<dyn Inode>,
         remove_dir: bool,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
         // First, resolve the target inode so we can inspect its type.
-        let target_inode = self
-            .resolve_path_nofollow(path, root.clone(), task.clone())
-            .await?;
+        let target_inode = self.resolve_path_nofollow(path, root.clone(), task).await?;
 
         let attr = target_inode.getattr().await?;
 
@@ -511,15 +533,31 @@ impl VFS {
             root.clone()
         };
 
+        let parent_attr = parent_inode.getattr().await?;
+
         // Ensure the parent really is a directory.
-        if parent_inode.getattr().await?.file_type != FileType::Directory {
+        if parent_attr.file_type != FileType::Directory {
             return Err(FsError::NotADirectory.into());
+        }
+
+        {
+            let creds = task.creds.lock_save_irq();
+
+            if attr.permissions.contains(FilePermissions::S_ISVTX)
+                && attr.uid != creds.euid()
+                && parent_attr.uid != creds.euid()
+            {
+                creds.caps().check_capable(CapabilitiesFlags::CAP_FOWNER)?;
+            }
         }
 
         // Extract the final component (name) and perform the unlink on the parent.
         let name = path.file_name().ok_or(FsError::InvalidInput)?;
 
         parent_inode.unlink(name).await?;
+        let is_dir = attr.file_type == FileType::Directory;
+        notify_delete(parent_inode.id(), name, is_dir).await;
+        notify_delete_self(target_inode.id(), is_dir).await;
 
         Ok(())
     }
@@ -531,7 +569,9 @@ impl VFS {
         name: &str,
     ) -> Result<()> {
         // just delegate to inode only, all handling is done at the syscall level
-        new_parent.link(name, target).await
+        new_parent.link(name, target).await?;
+        notify_create(new_parent.id(), name, false).await;
+        Ok(())
     }
 
     pub async fn symlink(
@@ -539,9 +579,9 @@ impl VFS {
         target: &Path,
         link: &Path,
         root: Arc<dyn Inode>,
-        task: Arc<Task>,
+        task: &Arc<Task>,
     ) -> Result<()> {
-        match self.resolve_path(link, root.clone(), task.clone()).await {
+        match self.resolve_path(link, root.clone(), task).await {
             Ok(_) => Err(FsError::AlreadyExists.into()),
             Err(KernelError::Fs(FsError::NotFound)) => {
                 let name = link.file_name().ok_or(FsError::InvalidInput)?;
@@ -557,7 +597,9 @@ impl VFS {
                     return Err(FsError::NotADirectory.into());
                 }
 
-                parent_inode.symlink(name, target).await
+                parent_inode.symlink(name, target).await?;
+                notify_create(parent_inode.id(), name, false).await;
+                Ok(())
             }
             Err(e) => Err(e),
         }
@@ -571,9 +613,24 @@ impl VFS {
         new_name: &str,
         no_replace: bool,
     ) -> Result<()> {
+        let target_inode = old_parent_inode.lookup(old_name).await?;
+        let target_attr = target_inode.getattr().await?;
+
         new_parent_inode
-            .rename_from(old_parent_inode, old_name, new_name, no_replace)
-            .await
+            .rename_from(old_parent_inode.clone(), old_name, new_name, no_replace)
+            .await?;
+
+        notify_move(
+            old_parent_inode.id(),
+            old_name,
+            new_parent_inode.id(),
+            new_name,
+            target_inode.id(),
+            target_attr.file_type == FileType::Directory,
+        )
+        .await;
+
+        Ok(())
     }
 
     pub async fn exchange(
@@ -625,5 +682,16 @@ impl VFS {
             .get_fs(inode.id())
             .ok_or(FsError::NoDevice)?;
         fs.sync().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::fs::VFS;
+    use moss_macros::ktest;
+
+    #[ktest]
+    async fn test_sync_all() {
+        VFS.sync_all().await.unwrap();
     }
 }

@@ -1,18 +1,26 @@
-use super::{Task, Tid};
-use crate::{memory::uaccess::UserCopyable, sync::SpinLock};
+use super::Tid;
+use crate::{
+    drivers::fs::cgroup,
+    memory::uaccess::UserCopyable,
+    sched::{
+        sched_task::{Work, state::TaskState},
+        waker::create_waker,
+    },
+    sync::{CondVar, SpinLock},
+};
 use alloc::{
     collections::btree_map::BTreeMap,
     sync::{Arc, Weak},
+    vec::Vec,
 };
 use builder::ThreadGroupBuilder;
-use core::{
-    fmt::Display,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use core::sync::atomic::AtomicUsize;
+use core::{fmt::Display, sync::atomic::Ordering};
+use libkernel::{fs::pathbuf::PathBuf, sync::condvar::WakeupType};
 use pid::PidT;
 use rsrc_lim::ResourceLimits;
-use signal::{SigSet, SignalState};
-use wait::ChildNotifiers;
+use signal::{SigId, SigSet, SignalActionState};
+use wait::Notifiers;
 
 pub mod builder;
 pub mod pid;
@@ -46,7 +54,11 @@ impl Tgid {
         Self(0)
     }
 
-    pub fn from_pid_t(pid: PidT) -> Tgid {
+    fn from_tid(tid: Tid) -> Tgid {
+        Self(tid.0)
+    }
+
+    fn from_pid_t(pid: PidT) -> Tgid {
         Self(pid as _)
     }
 }
@@ -94,36 +106,26 @@ pub struct ThreadGroup {
     pub umask: SpinLock<u32>,
     pub parent: SpinLock<Option<Weak<ThreadGroup>>>,
     pub children: SpinLock<BTreeMap<Tgid, Arc<ThreadGroup>>>,
-    pub threads: SpinLock<BTreeMap<Tid, Weak<Task>>>,
-    pub signals: Arc<SpinLock<SignalState>>,
+    pub tasks: SpinLock<BTreeMap<Tid, Weak<Work>>>,
+    pub signals: Arc<SpinLock<SignalActionState>>,
     pub rsrc_lim: Arc<SpinLock<ResourceLimits>>,
     pub pending_signals: SpinLock<SigSet>,
-    pub child_notifiers: ChildNotifiers,
-    next_tid: AtomicU32,
+    pub priority: SpinLock<i8>,
+    pub child_notifiers: Notifiers,
+    /// `true` while a parent is blocked in `CLONE_VFORK` waiting for this
+    /// process to either `execve()` successfully or exit.
+    pub vfork_blocked_parent: CondVar<bool>,
+    pub utime: AtomicUsize,
+    pub stime: AtomicUsize,
+    pub last_account: AtomicUsize,
+    pub executable: SpinLock<Option<PathBuf>>,
 }
 
 unsafe impl Send for ThreadGroup {}
 
 impl ThreadGroup {
-    // Return the next avilable thread id. Will never return a thread who's ID
-    // == TGID, since that is defined as the main, root thread.
-    pub fn next_tid(&self) -> Tid {
-        let mut v = self.next_tid.fetch_add(1, Ordering::Relaxed);
-
-        // Skip the TGID.
-        if v == self.tgid.value() {
-            v = self.next_tid.fetch_add(1, Ordering::Relaxed)
-        }
-
-        Tid(v)
-    }
-
-    pub fn next_tgid() -> Tgid {
-        Tgid(NEXT_TGID.fetch_add(1, Ordering::SeqCst))
-    }
-
-    pub fn new_child(self: Arc<Self>, share_state: bool) -> (Arc<ThreadGroup>, Tid) {
-        let mut builder = ThreadGroupBuilder::new(Self::next_tgid()).with_parent(self.clone());
+    pub fn new_child(self: Arc<Self>, share_state: bool, tid: Tid) -> Arc<ThreadGroup> {
+        let mut builder = ThreadGroupBuilder::new(Tgid::from_tid(tid)).with_parent(self.clone());
 
         if share_state {
             builder = builder
@@ -145,21 +147,114 @@ impl ThreadGroup {
             .lock_save_irq()
             .insert(new_tg.tgid, new_tg.clone());
 
-        (new_tg.clone(), Tid(new_tg.tgid.value()))
+        new_tg.clone()
     }
 
     pub fn get(id: Tgid) -> Option<Arc<Self>> {
         TG_LIST.lock_save_irq().get(&id).and_then(|x| x.upgrade())
     }
+
+    pub fn start_vfork(&self) {
+        self.vfork_blocked_parent.update(|blocked| {
+            *blocked = true;
+            WakeupType::None
+        });
+    }
+
+    pub async fn wait_for_vfork_release(&self) {
+        self.vfork_blocked_parent
+            .wait_until(|blocked| (!*blocked).then_some(()))
+            .await;
+    }
+
+    pub fn complete_vfork(&self) {
+        self.vfork_blocked_parent.update(|blocked| {
+            if *blocked {
+                *blocked = false;
+                WakeupType::All
+            } else {
+                WakeupType::None
+            }
+        });
+    }
+
+    pub fn notify_signal_waiters(&self) {
+        let tasks: Vec<_> = self
+            .tasks
+            .lock_save_irq()
+            .values()
+            .filter_map(|task| task.upgrade())
+            .collect();
+
+        for task in tasks {
+            task.notify_signal_waiters();
+        }
+    }
+
+    pub fn queue_signal(&self, signal: SigId) {
+        self.pending_signals.lock_save_irq().set_signal(signal);
+        self.notify_signal_waiters();
+    }
+
+    pub fn set_pending_signals(&self, signals: SigSet) {
+        *self.pending_signals.lock_save_irq() = signals;
+        self.notify_signal_waiters();
+    }
+
+    pub fn deliver_signal(&self, signal: SigId) {
+        match signal {
+            SigId::SIGKILL => {
+                // Set the sigkill marker in the pending signals and wake up all
+                // tasks in this group.
+                self.set_pending_signals(SigSet::SIGKILL);
+
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade() {
+                        // Wake will handle Sleeping/Stopped → Enqueue,
+                        // and Running/Pending* → PreventedSleep (sets Woken).
+                        create_waker(task).wake();
+                    }
+                }
+            }
+            _ => {
+                self.queue_signal(signal);
+
+                // See whether there is a task that can action the signal.
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade()
+                        && matches!(
+                            task.state.load(Ordering::Acquire),
+                            TaskState::Runnable
+                                | TaskState::Running
+                                | TaskState::Woken
+                                | TaskState::PendingSleep
+                                | TaskState::PendingStop
+                        )
+                    {
+                        // Signal delivered. This task will eventually be
+                        // dispatched again by the uspc_ret code and the
+                        // signal picked up.
+                        return;
+                    }
+                }
+
+                // No task will pick up the signal. Wake one up.
+                for task in self.tasks.lock_save_irq().values() {
+                    if let Some(task) = task.upgrade() {
+                        create_waker(task).wake();
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Drop for ThreadGroup {
     fn drop(&mut self) {
+        cgroup::unregister_thread_group(self.tgid);
         TG_LIST.lock_save_irq().remove(&self.tgid);
     }
 }
-
-// the idle process (0) and the init process (1) are allocated manually.
-static NEXT_TGID: AtomicU32 = AtomicU32::new(2);
 
 static TG_LIST: SpinLock<BTreeMap<Tgid, Weak<ThreadGroup>>> = SpinLock::new(BTreeMap::new());

@@ -1,14 +1,14 @@
 use super::MemoryMap;
 use crate::{
-    PageInfo, UserAddressSpace,
     error::Result,
     fs::Inode,
     memory::{
         PAGE_SIZE,
         address::VA,
         page::PageFrame,
-        permissions::PtePermissions,
+        paging::permissions::PtePermissions,
         proc_vm::{
+            address_space::{PageInfo, UserAddressSpace},
             memory_map::{AddressRequest, MMAP_BASE},
             vmarea::{VMAPermissions, VMArea, VMAreaKind, VMFileMapping, tests::DummyTestInode},
         },
@@ -194,6 +194,7 @@ fn test_mmap_any_empty() {
             size,
             VMAPermissions::rw(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
 
@@ -218,6 +219,7 @@ fn test_mmap_any_with_existing() {
             size,
             VMAPermissions::ro(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
 
@@ -231,6 +233,7 @@ fn test_mmap_any_with_existing() {
             size,
             VMAPermissions::ro(), // different permissions to prevent merge.
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
     assert_eq!(bottom_addr.value(), existing_addr - size);
@@ -254,6 +257,7 @@ fn test_mmap_hint_free() {
             size,
             VMAPermissions::rw(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
 
@@ -282,6 +286,7 @@ fn test_mmap_hint_taken() {
             size,
             VMAPermissions::rw(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
 
@@ -309,6 +314,7 @@ fn test_mmap_fixed_clobber_complete_overlap() {
             3 * PAGE_SIZE,
             VMAPermissions::rw(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .unwrap();
 
@@ -345,6 +351,7 @@ fn test_mmap_fixed_clobber_partial_end() {
         new_size,
         VMAPermissions::rw(),
         VMAreaKind::Anon,
+        String::new(),
     )
     .unwrap();
 
@@ -378,6 +385,7 @@ fn test_mmap_fixed_clobber_partial_end_spill() {
         new_size,
         VMAPermissions::rw(),
         VMAreaKind::Anon,
+        String::new(),
     )
     .unwrap();
 
@@ -413,6 +421,7 @@ fn test_mmap_fixed_no_clobber_fails() {
             new_size,
             VMAPermissions::rw(),
             VMAreaKind::Anon,
+            String::new(),
         )
         .is_err()
     );
@@ -438,6 +447,7 @@ fn test_mmap_fixed_clobber_punch_hole() {
         new_size,
         VMAPermissions::ro(),
         VMAreaKind::Anon,
+        String::new(),
     )
     .unwrap();
 

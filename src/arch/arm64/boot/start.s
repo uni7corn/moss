@@ -49,6 +49,9 @@ _start:
 2:  adr_r   x0, __boot_stack      // Address of early boot stack
     mov     sp, x0                // Set stack pointer
 
+    // Sanitize TPIDR_EL1 so Rust allocators know per-cpu data isn't ready.
+    msr     tpidr_el1, xzr
+
     // Transition to EL1 (if not already there)
     // This typically drops from EL2 to EL1 and sets up minimal EL1 state
     bl      transition_to_el1

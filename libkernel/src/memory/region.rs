@@ -1,4 +1,4 @@
-//! `region` module: Contiguous memory regions.
+//! Contiguous memory regions.
 //!
 //! This module defines `MemoryRegion<T>`, a generic abstraction for handling
 //! ranges of memory in both physical and virtual address spaces.
@@ -29,11 +29,11 @@
 //! let mapped = region.map_via::<IdentityTranslator>();
 //! ```
 
-use crate::memory::PAGE_MASK;
-
 use super::{
     PAGE_SHIFT, PAGE_SIZE,
-    address::{Address, AddressTranslator, MemKind, Physical, User, Virtual},
+    address::{
+        Address, AddressTranslator, GuestPhysical, GuestVirtual, MemKind, Physical, User, Virtual,
+    },
     page::PageFrame,
 };
 
@@ -53,6 +53,21 @@ impl<T: MemKind> MemoryRegion<T> {
         Self { address, size }
     }
 
+    /// Cast from one address space kind to the other, without modification of
+    /// the address bits.
+    ///
+    /// # Safety
+    ///
+    /// the caller must ensure that the same address is valid in the other
+    /// address space, e.g. through identity mappings.
+    pub const unsafe fn cast_mem_kind<O: MemKind>(self) -> MemoryRegion<O> {
+        // SAFETY: The caller ensures the safety invariant is true.
+        MemoryRegion {
+            address: unsafe { self.address.cast_mem_kind() },
+            size: self.size,
+        }
+    }
+
     /// Create an empty region with a size of 0 and address 0.
     pub const fn empty() -> Self {
         Self {
@@ -61,15 +76,41 @@ impl<T: MemKind> MemoryRegion<T> {
         }
     }
 
+    /// Returns `true` if this memory region is empty.
+    pub fn is_empty(self) -> bool {
+        self.size == 0
+    }
+
     /// Create a memory region from a start and end address.
     ///
     /// The size is calculated as `end - start`. No alignment is enforced.
-    pub fn from_start_end_address(start: Address<T, ()>, end: Address<T, ()>) -> Self {
-        assert!(end >= start);
+    pub const fn from_start_end_address(start: Address<T, ()>, end: Address<T, ()>) -> Self {
+        assert!(end.value() >= start.value());
 
         Self {
             address: start,
             size: (end.value() - start.value()),
+        }
+    }
+
+    /// Cap the size of the region. If `max_size < self.size`, the region is
+    /// shrunk.
+    pub fn cap_size(self, max_size: usize) -> Self {
+        if max_size < self.size {
+            Self::new(self.start_address(), max_size)
+        } else {
+            self
+        }
+    }
+
+    /// Shrink this region by moving the start address 'forward' by `x` bytes.
+    ///
+    /// If `x` moves the start address beyond the end of the region, it
+    /// saturates on the boundary and becomes empty.
+    pub fn shrink_start(self, x: usize) -> Self {
+        Self {
+            address: self.start_address().add_bytes(x),
+            size: self.size.saturating_sub(x),
         }
     }
 
@@ -253,8 +294,8 @@ impl<T: MemKind> MemoryRegion<T> {
     }
 
     /// Increases the capacity of the region by size bytes.
-    pub(crate) fn expand_by(&mut self, size: usize) {
-        assert!(size & PAGE_MASK == 0);
+    pub fn expand_by(&mut self, size: usize) {
+        assert!(size & crate::memory::PAGE_MASK == 0);
 
         self.size += size;
     }
@@ -383,6 +424,7 @@ impl PhysMemoryRegion {
         VirtMemoryRegion::new(self.address.to_va::<T>(), self.size)
     }
 
+    /// Returns an iterator over the page frame numbers in this region.
     pub fn iter_pfns(self) -> impl Iterator<Item = PageFrame> {
         let mut count = 0;
         let pages_count = self.size >> PAGE_SHIFT;
@@ -413,6 +455,12 @@ impl VirtMemoryRegion {
 
 /// A memory region of user-space addresses.
 pub type UserMemoryRegion = MemoryRegion<User>;
+
+/// A memory region of guest-physical memory.
+pub type GuestPhysMemoryRegion = MemoryRegion<GuestPhysical>;
+
+/// A memory region of guest-virutal memory.
+pub type GuestVirtualMemoryRegion = MemoryRegion<GuestVirtual>;
 
 /// A representation of a `MemoryRegion` that has been expanded to be page-aligned.
 ///
@@ -672,6 +720,83 @@ mod tests {
         let main = region(0x1000, 0x1000);
         let hole = region(0x2000, 0x1000);
         assert_eq!(main.punch_hole(hole), (Some(main), None));
+    }
+
+    #[test]
+    fn is_empty_zero_size() {
+        let r = region(0x1000, 0);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn is_empty_nonzero_size() {
+        let r = region(0x1000, 0x10);
+        assert!(!r.is_empty());
+    }
+
+    #[test]
+    fn is_empty_empty_constructor() {
+        assert!(PhysMemoryRegion::empty().is_empty());
+    }
+
+    #[test]
+    fn cap_size_below_current() {
+        let r = region(0x1000, 0x100);
+        let capped = r.cap_size(0x50);
+        assert_eq!(capped.start_address().value(), 0x1000);
+        assert_eq!(capped.size(), 0x50);
+    }
+
+    #[test]
+    fn cap_size_equal_to_current() {
+        let r = region(0x1000, 0x100);
+        let capped = r.cap_size(0x100);
+        assert_eq!(capped, r);
+    }
+
+    #[test]
+    fn cap_size_above_current() {
+        let r = region(0x1000, 0x100);
+        let capped = r.cap_size(0x200);
+        assert_eq!(capped, r);
+    }
+
+    #[test]
+    fn cap_size_to_zero() {
+        let r = region(0x1000, 0x100);
+        let capped = r.cap_size(0);
+        assert_eq!(capped.start_address().value(), 0x1000);
+        assert!(capped.is_empty());
+    }
+
+    #[test]
+    fn shrink_start_within_bounds() {
+        let r = region(0x1000, 0x100);
+        let shrunk = r.shrink_start(0x40);
+        assert_eq!(shrunk.start_address().value(), 0x1040);
+        assert_eq!(shrunk.size(), 0xC0);
+    }
+
+    #[test]
+    fn shrink_start_exact_size() {
+        let r = region(0x1000, 0x100);
+        let shrunk = r.shrink_start(0x100);
+        assert_eq!(shrunk.start_address().value(), 0x1100);
+        assert!(shrunk.is_empty());
+    }
+
+    #[test]
+    fn shrink_start_beyond_end_saturates() {
+        let r = region(0x1000, 0x100);
+        let shrunk = r.shrink_start(0x200);
+        assert_eq!(shrunk.start_address().value(), 0x1200);
+        assert!(shrunk.is_empty());
+    }
+
+    #[test]
+    fn shrink_start_zero() {
+        let r = region(0x1000, 0x100);
+        assert_eq!(r.shrink_start(0), r);
     }
 
     #[test]

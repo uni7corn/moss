@@ -73,12 +73,15 @@ pub fn probe_for_fdt_devices() {
                 Err(KernelError::Probe(ProbeError::Deferred)) => {
                     deferred_list.push(desc);
                 }
+                Err(KernelError::Probe(ProbeError::NoMatch)) => {
+                    // Driver inspected the device but it's not a match; skip silently.
+                }
                 Ok(None) => {
                     // No driver found for this compatible string. Not an error, just ignore.
                 }
                 Err(e) => {
                     // A fatal error occurred during probe.
-                    error!("Fatal error while probing device \"{}\": {}", desc, e);
+                    error!("Fatal error while probing device \"{desc}\": {e}");
                 }
             }
         }
@@ -89,10 +92,7 @@ pub fn probe_for_fdt_devices() {
         // If we made no progress in a full pass, we are done (or have an unresolvable dependency).
         if !progress_made && !to_probe.is_empty() {
             for desc in &to_probe {
-                warn!(
-                    "Could not probe device \"{}\" due to missing dependencies.",
-                    desc
-                );
+                warn!("Could not probe device \"{desc}\" due to missing dependencies.");
             }
             break;
         }

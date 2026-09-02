@@ -6,6 +6,7 @@ use crate::{
                 arch_init_secondary,
                 memory::{KERNEL_STACK_PG_ORDER, allocate_kstack_region},
             },
+            memory::flush_to_ram,
             psci::{PSCIEntry, PSCIMethod, boot_secondary_psci},
         },
     },
@@ -14,6 +15,7 @@ use crate::{
     memory::PAGE_ALLOC,
     sync::OnceLock,
 };
+use aarch64_cpu::asm::barrier::{SY, isb};
 use core::{
     arch::naked_asm,
     hint::spin_loop,
@@ -22,11 +24,12 @@ use core::{
     time::Duration,
 };
 use libkernel::{
-    CpuOps, KernAddressSpace, VirtualMemory,
+    CpuOps,
     error::{KernelError, Result},
     memory::{
         address::{PA, VA},
-        permissions::PtePermissions,
+        paging::permissions::PtePermissions,
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
     },
 };
 use log::{info, warn};
@@ -122,7 +125,9 @@ fn prepare_for_secondary_entry() -> Result<(PA, PA)> {
     )?;
 
     unsafe {
-        (&raw mut SECONDARY_BOOT_CTX as *mut SecondaryBootInfo).write(SecondaryBootInfo {
+        let boot_ctx = &raw mut SECONDARY_BOOT_CTX as *mut SecondaryBootInfo;
+
+        boot_ctx.write(SecondaryBootInfo {
             boot_stack_addr: boot_stack,
             kstack_addr: kstack_vaddr.end_address(),
             kmem_ttbr: ArchImpl::kern_address_space().lock_save_irq().table_pa(),
@@ -131,7 +136,14 @@ fn prepare_for_secondary_entry() -> Result<(PA, PA)> {
                 .ok_or(KernelError::Other("Idmap not set"))?,
             start_fn: VA::from_value(arch_init_secondary as *const () as usize),
             exception_ret: VA::from_value(&exception_return as *const _ as usize),
-        })
+        });
+
+        // Flush the cache to SRAM. Since the secondary will start without the
+        // MMU enabled (and therefore caches), we can't reply on the CCI.
+        // Therefore, manually flush the boot context to RAM.
+        flush_to_ram(boot_ctx);
+
+        isb(SY);
     };
 
     Ok((entry_fn, ctx))
@@ -186,7 +198,7 @@ fn cpu_node_iter() -> impl Iterator<Item = fdt_parser::Node<'static>> {
 pub fn boot_secondaries() {
     for cpu_node in cpu_node_iter() {
         if let Err(e) = do_boot_secondary(cpu_node) {
-            log::warn!("Failed to boot secondary: {}", e);
+            log::warn!("Failed to boot secondary: {e}");
         }
     }
 }
@@ -204,7 +216,7 @@ pub fn save_idmap(addr: PA) {
 pub fn secondary_booted() {
     let id = ArchImpl::id();
 
-    info!("CPU {} online.", id);
+    info!("CPU {id} online.");
 
     SECONDARY_BOOT_FLAG.store(true, Ordering::Release);
 }

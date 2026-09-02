@@ -137,4 +137,22 @@ pub trait FileOps: Send + Sync {
     ) -> Result<usize> {
         Err(KernelError::InvalidValue)
     }
+
+    fn as_socket(&mut self) -> Option<&mut dyn crate::net::SocketOps> {
+        None
+    }
+
+    fn as_epoll(&mut self) -> Option<&mut dyn crate::process::epoll::EpollOps> {
+        None
+    }
+
+    fn as_signalfd(
+        &mut self,
+    ) -> Option<&mut crate::process::thread_group::signal::signalfd::SignalFd> {
+        None
+    }
+
+    fn as_inotify(&mut self) -> Option<&mut crate::process::inotify::Inotify> {
+        None
+    }
 }

@@ -20,21 +20,26 @@ use crate::{
     sync::SpinLock,
 };
 
+pub mod chrdev;
+pub mod display;
 pub mod fdt_prober;
 pub mod fs;
 pub mod init;
 pub mod interrupts;
-pub mod null;
 pub mod probe;
+pub mod rng;
+pub mod rtc;
 pub mod timer;
 pub mod uart;
-pub mod zero;
+mod virtio_hal;
 
 #[repr(u64)]
 pub enum ReservedMajors {
     Null = 1,
     Zero = 2,
+    Random = 3,
     Console = 5,
+    Fb = 6,
     Uart = 10,
     End = 11,
 }

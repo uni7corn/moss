@@ -1,9 +1,16 @@
-use crate::{process::ProcVM, sched::current_task};
+use crate::{process::ProcVM, sync::SpinLock};
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use libkernel::{
-    PageInfo, UserAddressSpace,
     error::{KernelError, MapError, Result},
-    memory::{address::VA, permissions::PtePermissions, proc_vm::vmarea::AccessKind},
+    memory::{
+        address::VA,
+        paging::permissions::PtePermissions,
+        proc_vm::{
+            address_space::{PageInfo, UserAddressSpace},
+            vmarea::AccessKind,
+        },
+    },
 };
 
 use super::{PAGE_ALLOC, page::ClaimedPage};
@@ -38,10 +45,12 @@ pub enum FaultResolution {
 
 /// Handle a page fault when a PTE is not present.
 pub fn handle_demand_fault(
-    vm: &mut ProcVM,
+    proc_vm: Arc<SpinLock<ProcVM>>,
     faulting_addr: VA,
     access_kind: AccessKind,
 ) -> Result<FaultResolution> {
+    let mut vm = proc_vm.lock_save_irq();
+
     let vma = match vm.find_vma_for_fault(faulting_addr, access_kind) {
         Some(vma) => vma,
         None => return Ok(FaultResolution::Denied),
@@ -52,6 +61,8 @@ pub fn handle_demand_fault(
     let page_va = faulting_addr.page_aligned();
 
     if let Some(vma_read) = vma.resolve_fault(faulting_addr) {
+        drop(vm);
+
         Ok(FaultResolution::Deferred(Box::new(async move {
             let pg_buf = &mut new_page.as_slice_mut()
                 [vma_read.page_offset..vma_read.page_offset + vma_read.read_len];
@@ -60,8 +71,7 @@ pub fn handle_demand_fault(
 
             // Since the above may have put the task to sleep, revalidate the
             // VMA access.
-            let task = current_task();
-            let mut vm = task.vm.lock_save_irq();
+            let mut vm = proc_vm.lock_save_irq();
 
             // If the handler in the deferred case is no longer valid. Allow
             // the program to back to user-space without touching the page
@@ -80,7 +90,7 @@ pub fn handle_demand_fault(
                 PtePermissions::from(vma.permissions()),
             ) {
                 Ok(_) => {
-                    // We mapped our page, leak it for reclimation by the
+                    // We mapped our page, leak it for reclamation by the
                     // address-space tear-down code.
                     new_page.leak();
 
@@ -89,7 +99,7 @@ pub fn handle_demand_fault(
                 Err(KernelError::MappingError(MapError::AlreadyMapped)) => {
                     // Another CPU mapped the page for us, since we've validated the
                     // VMA is still valid and the same mapping code has been
-                    // executed, it's guarenteed that the correct page will have
+                    // executed, it's guaranteed that the correct page will have
                     // been mapped by the other CPU.
                     //
                     // Do not leak the page, since it's not going to be used.
@@ -120,7 +130,7 @@ pub fn handle_demand_fault(
 }
 
 /// Handle a page fault when a page is present, but the access kind differ from
-/// permissble accessees defined in the PTE, a 'protection' fault.
+/// permissible accesses defined in the PTE, a 'protection' fault.
 pub fn handle_protection_fault(
     vm: &mut ProcVM,
     faulting_addr: VA,
@@ -157,7 +167,7 @@ pub fn handle_protection_fault(
         } else {
             let mut new_page = ClaimedPage::alloc_zeroed()?;
 
-            // Oterwise, copy data from the new page, map it and decrement
+            // Otherwise, copy data from the new page, map it and decrement
             // the refcount on the shared page.
             let src_page = unsafe { ClaimedPage::from_pfn(pg_info.pfn) };
 

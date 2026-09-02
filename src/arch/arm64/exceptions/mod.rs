@@ -3,20 +3,22 @@ use super::memory::{
     fault::{handle_kernel_mem_fault, handle_mem_fault},
 };
 use crate::{
-    arch::ArchImpl,
+    arch::{ArchImpl, arm64::boot::memory::KERNEL_STACK_PG_ORDER},
     interrupts::get_interrupt_root,
     ksym_pa,
-    sched::{current_task, uspc_ret::dispatch_userspace_task},
+    memory::PAGE_ALLOC,
+    sched::{syscall_ctx::ProcessCtx, uspc_ret::dispatch_userspace_task},
     spawn_kernel_work,
 };
 use aarch64_cpu::registers::{CPACR_EL1, ReadWriteable, VBAR_EL1};
 use core::{arch::global_asm, fmt::Display};
 use esr::{Esr, Exception};
 use libkernel::{
-    KernAddressSpace, VirtualMemory,
     error::Result,
     memory::{
-        permissions::PtePermissions,
+        address::VA,
+        paging::permissions::PtePermissions,
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
         region::{PhysMemoryRegion, VirtMemoryRegion},
     },
 };
@@ -26,11 +28,13 @@ use tock_registers::interfaces::Writeable;
 pub mod esr;
 mod syscall;
 
-const EXCEPTION_TBL_SZ: usize = 0x800;
-
 unsafe extern "C" {
-    pub static exception_vectors: u8;
+    pub static __vectors_start: u8;
+    pub static __vectors_end: u8;
 }
+
+#[unsafe(no_mangle)]
+pub static EMERG_STACK_END: VA = VA::from_value(0xffff_c000_0000_0000);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,7 +82,7 @@ impl Display for ExceptionState {
 global_asm!(include_str!("exceptions.s"));
 
 pub fn default_handler(state: &ExceptionState) {
-    panic!("Unhandled CPU exception.  Program state:\n{}", state);
+    panic!("Unhandled CPU exception.  Program state:\n{state}");
 }
 
 #[unsafe(no_mangle)]
@@ -144,7 +148,11 @@ extern "C" fn el1_serror_spx(state: &mut ExceptionState) {
 
 #[unsafe(no_mangle)]
 extern "C" fn el0_sync(state_ptr: *mut ExceptionState) -> *const ExceptionState {
-    current_task().ctx.lock_save_irq().save_user_ctx(state_ptr);
+    // SAFETY: Since we've just entered form EL0, there *cannot* be another
+    // syscall currently running for this task, therefore exclusive access to
+    // `OwnedTask` is guaranteed.
+    let mut ctx = unsafe { ProcessCtx::from_current() };
+    ctx.task_mut().ctx.save_user_ctx(state_ptr);
 
     let state = unsafe { state_ptr.as_ref().unwrap() };
 
@@ -154,10 +162,14 @@ extern "C" fn el0_sync(state_ptr: *mut ExceptionState) -> *const ExceptionState 
 
     match exception {
         Exception::InstrAbortLowerEL(info) | Exception::DataAbortLowerEL(info) => {
-            handle_mem_fault(exception, info);
+            handle_mem_fault(&mut ctx, exception, info);
         }
         Exception::SVC64(_) => {
-            spawn_kernel_work(handle_syscall());
+            // SAFETY: The other `ctx` won't be poll'd until
+            // `dispatch_userspace_task` at which point this variable will have
+            // gone out of scope.
+            let mut ctx2 = unsafe { ctx.clone() };
+            spawn_kernel_work(&mut ctx2, handle_syscall(ctx));
         }
         Exception::TrappedFP(_) => {
             CPACR_EL1.modify(CPACR_EL1::FPEN::TrapNothing);
@@ -174,7 +186,11 @@ extern "C" fn el0_sync(state_ptr: *mut ExceptionState) -> *const ExceptionState 
 
 #[unsafe(no_mangle)]
 extern "C" fn el0_irq(state: *mut ExceptionState) -> *mut ExceptionState {
-    current_task().ctx.lock_save_irq().save_user_ctx(state);
+    // SAFETY: Since we've just entered form EL0, there *cannot* be another
+    // syscall currently running for this task, therefore exclusive access to
+    // `OwnedTask` is guaranteed.
+    let mut ctx = unsafe { ProcessCtx::from_current() };
+    ctx.task_mut().ctx.save_user_ctx(state);
 
     match get_interrupt_root() {
         Some(ref im) => im.handle_interrupt(),
@@ -200,15 +216,33 @@ extern "C" fn el0_serror(state: &mut ExceptionState) {
 }
 
 pub fn exceptions_init() -> Result<()> {
-    let pa = ksym_pa!(exception_vectors);
-    let region = PhysMemoryRegion::new(pa, EXCEPTION_TBL_SZ);
+    let start = ksym_pa!(__vectors_start);
+    let end = ksym_pa!(__vectors_end);
+    let region = PhysMemoryRegion::from_start_end_address(start, end);
 
     let mappable_region = region.to_mappable_region();
 
-    ArchImpl::kern_address_space().lock_save_irq().map_normal(
+    let mut kspc = ArchImpl::kern_address_space().lock_save_irq();
+
+    kspc.map_normal(
         mappable_region.region(),
         VirtMemoryRegion::new(EXCEPTION_BASE, mappable_region.region().size()),
         PtePermissions::rx(false),
+    )?;
+
+    let emerg_stack = PAGE_ALLOC
+        .get()
+        .unwrap()
+        .alloc_frames(KERNEL_STACK_PG_ORDER as _)?
+        .leak();
+
+    kspc.map_normal(
+        emerg_stack,
+        VirtMemoryRegion::new(
+            EMERG_STACK_END.sub_bytes(emerg_stack.size()),
+            emerg_stack.size(),
+        ),
+        PtePermissions::rw(false),
     )?;
 
     secondary_exceptions_init();

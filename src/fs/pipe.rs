@@ -1,17 +1,39 @@
 use crate::{
+    clock::realtime::date,
     kernel::kpipe::KPipe,
     memory::uaccess::copy_to_user,
-    process::{fd_table::Fd, thread_group::signal::SigId},
-    sched::current_task,
+    process::{
+        fd_table::Fd,
+        thread_group::signal::{InterruptResult, Interruptable, SigId},
+    },
+    sched::{current_work, syscall_ctx::ProcessCtx},
     sync::CondVar,
 };
+use core::pin::Pin;
+
 use alloc::{boxed::Box, sync::Arc};
 use async_trait::async_trait;
-use core::{future, pin::pin, task::Poll};
+use core::any::Any;
+use core::{
+    future,
+    pin::pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::Poll,
+    time::Duration,
+};
+use futures::FutureExt;
 use libkernel::{
     error::{KernelError, Result},
-    fs::{OpenFlags, SeekFrom},
-    memory::address::{TUA, UA},
+    fs::{
+        FileType, Inode, InodeId, OpenFlags, SeekFrom,
+        attr::{FileAttr, FilePermissions},
+        pathbuf::PathBuf,
+    },
+    memory::{
+        PAGE_SIZE,
+        address::{TUA, UA},
+    },
+    proc::ids::{Gid, Uid},
     sync::condvar::WakeupType,
 };
 //
@@ -19,6 +41,42 @@ use super::{
     fops::FileOps,
     open_file::{FileCtx, OpenFile},
 };
+
+struct PipeInode {
+    id: InodeId,
+    time: Duration,
+    uid: Uid,
+    gid: Gid,
+}
+
+#[async_trait]
+impl Inode for PipeInode {
+    fn id(&self) -> InodeId {
+        self.id
+    }
+
+    async fn getattr(&self) -> Result<FileAttr> {
+        Ok(FileAttr {
+            id: self.id,
+            size: 0,
+            block_size: PAGE_SIZE as _,
+            blocks: 0,
+            atime: self.time,
+            btime: self.time,
+            mtime: self.time,
+            ctime: self.time,
+            file_type: FileType::Fifo,
+            permissions: FilePermissions::from_bits_retain(0o0600),
+            nlinks: 1,
+            uid: self.uid,
+            gid: self.gid,
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 #[derive(Clone)]
 struct PipeInner {
@@ -42,7 +100,7 @@ impl PipeReader {
                     .wait_until(|gone| if *gone { Some(()) } else { None })
             );
 
-        future::poll_fn(move |cx| {
+        match future::poll_fn(move |cx| {
             // Check the consumption future first, before we check whether the
             // other side of the pipe has gone. This ensures we drain the buffer
             // first.
@@ -54,12 +112,35 @@ impl PipeReader {
                 Poll::Pending
             }
         })
+        .interruptable()
         .await
+        {
+            InterruptResult::Interrupted => Err(KernelError::Interrupted),
+            InterruptResult::Uninterrupted(r) => r,
+        }
     }
 }
 
 #[async_trait]
 impl FileOps for PipeReader {
+    fn poll_read_ready(&self) -> Pin<Box<dyn Future<Output = Result<()>> + 'static + Send>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let mut read_fut = Box::pin(inner.buf.read_ready().fuse());
+            let mut gone_cond = Box::pin(
+                inner
+                    .other_side_gone
+                    .wait_until(|gone| if *gone { Some(()) } else { None })
+                    .fuse(),
+            );
+
+            futures::select_biased! {
+                _ = read_fut => Ok(()),
+                _ = gone_cond => Ok(()),
+            }
+        })
+    }
+
     async fn read(&mut self, _ctx: &mut FileCtx, u_buf: UA, count: usize) -> Result<usize> {
         self.readat(u_buf, count, 0).await
     }
@@ -125,7 +206,7 @@ impl PipeWriter {
             // buffer. There's no point writing data if there's no consumer!
             if gone_fut.as_mut().poll(cx).is_ready() {
                 // Other side of the pipe has been closed.
-                current_task().raise_task_signal(SigId::SIGPIPE);
+                current_work().process.deliver_signal(SigId::SIGPIPE);
                 Poll::Ready(Err(KernelError::BrokenPipe))
             } else if let Poll::Ready(x) = write_fut.as_mut().poll(cx) {
                 Poll::Ready(x)
@@ -139,6 +220,28 @@ impl PipeWriter {
 
 #[async_trait]
 impl FileOps for PipeWriter {
+    fn poll_write_ready(&self) -> Pin<Box<dyn Future<Output = Result<()>> + 'static + Send>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let mut write_fut = Box::pin(inner.buf.write_ready());
+            let mut gone_cond = Box::pin(
+                inner
+                    .other_side_gone
+                    .wait_until(|gone| if *gone { Some(()) } else { None }),
+            );
+
+            future::poll_fn(move |cx| {
+                if write_fut.as_mut().poll(cx).is_ready() || gone_cond.as_mut().poll(cx).is_ready()
+                {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await
+        })
+    }
+
     async fn read(&mut self, _ctx: &mut FileCtx, _buf: UA, _count: usize) -> Result<usize> {
         Err(KernelError::BadFd)
     }
@@ -185,7 +288,7 @@ impl Drop for PipeWriter {
     }
 }
 
-pub async fn sys_pipe2(fds: TUA<[Fd; 2]>, flags: u32) -> Result<usize> {
+pub async fn sys_pipe2(ctx: &ProcessCtx, fds: TUA<[Fd; 2]>, flags: u32) -> Result<usize> {
     let flags = OpenFlags::from_bits_retain(flags);
 
     let kbuf = KPipe::new()?;
@@ -203,11 +306,24 @@ pub async fn sys_pipe2(fds: TUA<[Fd; 2]>, flags: u32) -> Result<usize> {
     let writer = PipeWriter { inner };
 
     let (read_fd, write_fd) = {
-        let task = current_task();
-        let mut fds = task.fd_table.lock_save_irq();
+        static INODE_ID: AtomicU64 = AtomicU64::new(0);
+        let mut fds = ctx.task().fd_table.lock_save_irq();
 
-        let read_file = OpenFile::new(Box::new(reader), flags);
-        let write_file = OpenFile::new(Box::new(writer), flags);
+        let inode = {
+            let creds = ctx.task().creds.lock_save_irq();
+            Arc::new(PipeInode {
+                id: InodeId::from_fsid_and_inodeid(0xf, INODE_ID.fetch_add(1, Ordering::Relaxed)),
+                time: date(),
+                uid: creds.uid(),
+                gid: creds.gid(),
+            })
+        };
+
+        let mut read_file = OpenFile::new(Box::new(reader), flags);
+        let mut write_file = OpenFile::new(Box::new(writer), flags);
+
+        read_file.update(inode.clone(), PathBuf::new());
+        write_file.update(inode, PathBuf::new());
 
         let read_fd = fds.insert(Arc::new(read_file))?;
         let write_fd = fds.insert(Arc::new(write_file))?;
@@ -215,9 +331,14 @@ pub async fn sys_pipe2(fds: TUA<[Fd; 2]>, flags: u32) -> Result<usize> {
         (read_fd, write_fd)
     };
 
-    // TODO: What if the copy fails here, we've leaked the above file
-    // descriptors.
-    copy_to_user(fds, [read_fd as _, write_fd as _]).await?;
+    // copy_to_user will only EFAULT
+    if let Err(e) = copy_to_user(fds, [read_fd as _, write_fd as _]).await {
+        // Clean up the file descriptors we created.
+        let mut fds = ctx.task().fd_table.lock_save_irq();
+        fds.remove(read_fd);
+        fds.remove(write_fd);
+        return Err(e);
+    }
 
     Ok(0)
 }

@@ -1,42 +1,59 @@
 use crate::drivers::timer::Instant;
-use crate::process::threading::RobustListHead;
+use crate::sched::CPU_STAT;
+use crate::sched::sched_task::Work;
 use crate::{
-    arch::{Arch, ArchImpl},
-    fs::DummyInode,
+    arch::ArchImpl,
+    kernel::cpu_id::CpuId,
+    memory::{
+        PAGE_ALLOC,
+        fault::{FaultResolution, handle_demand_fault},
+    },
     sync::SpinLock,
 };
 use alloc::{
+    boxed::Box,
     collections::btree_map::BTreeMap,
     sync::{Arc, Weak},
 };
-use core::fmt::Display;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::time::Duration;
 use creds::Credentials;
-use ctx::{Context, UserCtx};
 use fd_table::FileDescriptorTable;
-use libkernel::memory::address::TUA;
-use libkernel::{VirtualMemory, fs::Inode};
+use libkernel::memory::proc_vm::address_space::{UserAddressSpace, VirtualMemory};
 use libkernel::{
-    fs::pathbuf::PathBuf,
+    error::{KernelError, Result},
+    fs::{Inode, pathbuf::PathBuf},
     memory::{
-        address::VA,
-        proc_vm::{ProcessVM, vmarea::VMArea},
+        address::{UA, VA},
+        allocators::phys::PageAllocation,
+        proc_vm::{ProcessVM, vmarea::AccessKind},
     },
+    sync::waker_set::WakerSet,
 };
-use thread_group::{
-    Tgid, ThreadGroup,
-    builder::ThreadGroupBuilder,
-    signal::{SigId, SigSet, SignalState},
-};
+use ptrace::PTrace;
+use thread_group::pid::PidT;
+use thread_group::signal::{AtomicSigSet, SigId};
+use thread_group::{Tgid, ThreadGroup};
 
+pub mod caps;
 pub mod clone;
 pub mod creds;
 pub mod ctx;
+pub mod epoll;
 pub mod exec;
 pub mod exit;
 pub mod fd_table;
+pub mod inotify;
+pub mod owned;
+pub mod pidfd;
+pub mod prctl;
+pub mod ptrace;
 pub mod sleep;
 pub mod thread_group;
 pub mod threading;
+
+// the idle process (0) and the init process (1) are allocated manually.
+static NEXT_TID: AtomicU32 = AtomicU32::new(2);
 
 // Thread Id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +66,18 @@ impl Tid {
 
     pub fn from_tgid(tgid: Tgid) -> Self {
         Self(tgid.0)
+    }
+
+    fn idle_for_cpu() -> Tid {
+        Self(CpuId::this().value() as _)
+    }
+
+    pub fn next_tid() -> Self {
+        Self(NEXT_TID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn from_pid_t(pid: PidT) -> Self {
+        Self(pid as _)
     }
 }
 
@@ -68,7 +97,7 @@ impl TaskDescriptor {
     pub fn this_cpus_idle() -> Self {
         Self {
             tgid: Tgid(0),
-            tid: Tid(0),
+            tid: Tid(CpuId::this().value() as _),
         }
     }
 
@@ -113,36 +142,50 @@ impl TaskDescriptor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState {
-    Running,
-    Runnable,
-    Woken,
-    Stopped,
-    Sleeping,
-    Finished,
-}
-
-impl Display for TaskState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let state_str = match self {
-            TaskState::Running => "R",
-            TaskState::Runnable => "R",
-            TaskState::Woken => "W",
-            TaskState::Stopped => "T",
-            TaskState::Sleeping => "S",
-            TaskState::Finished => "Z",
-        };
-        write!(f, "{}", state_str)
-    }
-}
-
-impl TaskState {
-    pub fn is_finished(self) -> bool {
-        matches!(self, Self::Finished)
-    }
-}
 pub type ProcVM = ProcessVM<<ArchImpl as VirtualMemory>::ProcessAddressSpace>;
+
+/// A per-task handle to a process address space.
+///
+/// Separate processes may temporarily share the same underlying `ProcVM`
+/// (e.g. `CLONE_VM` without `CLONE_THREAD`, including `CLONE_VFORK`) while
+/// still allowing one side to detach on `execve()` without affecting the
+/// other. Tasks in the same thread group share the same `VmHandle` so that an
+/// `execve()` updates the whole group consistently.
+pub struct VmHandle {
+    current: SpinLock<Arc<SpinLock<ProcVM>>>,
+}
+
+impl VmHandle {
+    pub fn new(vm: ProcVM) -> Self {
+        Self::from_shared(Arc::new(SpinLock::new(vm)))
+    }
+
+    pub fn from_shared(vm: Arc<SpinLock<ProcVM>>) -> Self {
+        Self {
+            current: SpinLock::new(vm),
+        }
+    }
+
+    pub fn shared_vm(&self) -> Arc<SpinLock<ProcVM>> {
+        self.current.lock_save_irq().clone()
+    }
+
+    pub fn replace(&self, vm: ProcVM) {
+        self.replace_shared(Arc::new(SpinLock::new(vm)));
+    }
+
+    pub fn replace_shared(&self, vm: Arc<SpinLock<ProcVM>>) {
+        *self.current.lock_save_irq() = vm;
+    }
+
+    pub fn activate(&self) {
+        self.shared_vm()
+            .lock_save_irq()
+            .mm_mut()
+            .address_space_mut()
+            .activate();
+    }
+}
 
 #[derive(Copy, Clone)]
 pub struct Comm([u8; 16]);
@@ -164,101 +207,44 @@ impl Comm {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct ITimer {
+    /// If interval is `None`, this timer is a one-shot timer.
+    pub interval: Option<Duration>,
+    /// Instant (wrt the needed clock) at which this timer will next expire.
+    pub next: Instant,
+}
+
+#[derive(Copy, Clone, Default)]
+pub struct ITimers {
+    pub real: Option<ITimer>,
+    // virtual is a reserved keyword
+    pub virtual_: Option<ITimer>,
+    pub prof: Option<ITimer>,
+}
+
 pub struct Task {
     pub tid: Tid,
     pub comm: Arc<SpinLock<Comm>>,
     pub process: Arc<ThreadGroup>,
-    pub vm: Arc<SpinLock<ProcVM>>,
+    pub vm: Arc<VmHandle>,
     pub cwd: Arc<SpinLock<(Arc<dyn Inode>, PathBuf)>>,
     pub root: Arc<SpinLock<(Arc<dyn Inode>, PathBuf)>>,
     pub creds: SpinLock<Credentials>,
+    pub i_timers: SpinLock<ITimers>,
     pub fd_table: Arc<SpinLock<FileDescriptorTable>>,
-    pub ctx: SpinLock<Context>,
-    pub sig_mask: SpinLock<SigSet>,
-    pub pending_signals: SpinLock<SigSet>,
-    pub vruntime: SpinLock<u64>,
-    pub exec_start: SpinLock<Option<Instant>>,
-    pub deadline: SpinLock<Option<Instant>>,
-    pub priority: i8,
-    pub last_run: SpinLock<Option<Instant>>,
-    pub state: Arc<SpinLock<TaskState>>,
-    pub robust_list: SpinLock<Option<TUA<RobustListHead>>>,
-    pub child_tid_ptr: SpinLock<Option<TUA<u32>>>,
+    pub ptrace: SpinLock<PTrace>,
+    pub sig_mask: AtomicSigSet,
+    pub pending_signals: AtomicSigSet,
+    pub signal_notifier: SpinLock<WakerSet>,
+    pub utime: AtomicUsize,
+    pub stime: AtomicUsize,
+    pub last_account: AtomicUsize,
 }
 
 impl Task {
-    pub fn create_idle_task(
-        addr_space: <ArchImpl as VirtualMemory>::ProcessAddressSpace,
-        user_ctx: UserCtx,
-        code_map: VMArea,
-    ) -> Self {
-        // SAFETY: The code page will have been mapped corresponding to the VMA.
-        let vm = unsafe { ProcessVM::from_vma_and_address_space(code_map, addr_space) };
-
-        let thread_group_builder = ThreadGroupBuilder::new(Tgid::idle())
-            .with_sigstate(Arc::new(SpinLock::new(SignalState::new_ignore())));
-
-        Self {
-            tid: Tid(0),
-            comm: Arc::new(SpinLock::new(Comm::new("idle"))),
-            process: thread_group_builder.build(),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            priority: i8::MIN,
-            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            creds: SpinLock::new(Credentials::new_root()),
-            ctx: SpinLock::new(Context::from_user_ctx(user_ctx)),
-            vm: Arc::new(SpinLock::new(vm)),
-            sig_mask: SpinLock::new(SigSet::empty()),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(None),
-            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(None),
-        }
-    }
-
-    pub fn create_init_task() -> Self {
-        Self {
-            tid: Tid(1),
-            comm: Arc::new(SpinLock::new(Comm::new("init"))),
-            process: ThreadGroupBuilder::new(Tgid::init()).build(),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
-            creds: SpinLock::new(Credentials::new_root()),
-            vm: Arc::new(SpinLock::new(
-                ProcessVM::empty().expect("Could not create init process's VM"),
-            )),
-            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(None),
-            sig_mask: SpinLock::new(SigSet::empty()),
-            priority: 0,
-            ctx: SpinLock::new(Context::from_user_ctx(
-                <ArchImpl as Arch>::new_user_context(VA::null(), VA::null()),
-            )),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(None),
-        }
-    }
-
     pub fn is_idle_task(&self) -> bool {
         self.process.tgid.is_idle()
-    }
-
-    pub fn priority(&self) -> i8 {
-        self.priority
-    }
-
-    pub fn set_priority(&mut self, priority: i8) {
-        self.priority = priority;
     }
 
     pub fn pgid(&self) -> Tgid {
@@ -269,19 +255,154 @@ impl Task {
         self.tid
     }
 
-    /// Return a new desctiptor that uniquely represents this task in the
+    /// Raise a signal on this specific task (thread-directed).
+    pub fn raise_task_signal(&self, signal: SigId) {
+        self.pending_signals.insert(signal.into());
+        self.notify_signal_waiters();
+    }
+
+    pub fn notify_signal_waiters(&self) {
+        self.signal_notifier.lock_save_irq().wake_all();
+    }
+
+    /// Check for a pending signal on this task or its process, respecting the
+    /// signal mask.
+    pub fn peek_signal(&self) -> Option<SigId> {
+        let mask = self.sig_mask.load();
+        self.pending_signals.peek_signal(mask).or_else(|| {
+            self.process
+                .pending_signals
+                .lock_save_irq()
+                .peek_signal(mask)
+        })
+    }
+
+    /// Take a pending signal from this task or its process, respecting the
+    /// signal mask.
+    pub fn take_signal(&self) -> Option<SigId> {
+        let mask = self.sig_mask.load();
+        self.pending_signals.take_signal(mask).or_else(|| {
+            self.process
+                .pending_signals
+                .lock_save_irq()
+                .take_signal(mask)
+        })
+    }
+
+    /// Return a new descriptor that uniquely represents this task in the
     /// system.
     pub fn descriptor(&self) -> TaskDescriptor {
         TaskDescriptor::from_tgid_tid(self.process.tgid, self.tid)
     }
 
-    pub fn raise_task_signal(&self, signal: SigId) {
-        self.pending_signals.lock_save_irq().insert(signal.into());
+    /// Get a page from the task's address space, in an atomic fashion - i.e.
+    /// with the process address space locked.
+    ///
+    /// Handle any faults such that the page will be resident in memory and return
+    /// an incremented refcount for the page such that it will not be free'd until
+    /// the returned allocation handle is dropped.
+    ///
+    /// SAFETY: The caller *must* guarantee that the returned page will only be
+    /// used as described in `access_kind`. i.e. if `AccessKind::Read` is passed
+    /// but data is written to this page, *bad* things will happen.
+    pub async unsafe fn get_page(
+        &self,
+        va: UA,
+        access_kind: AccessKind,
+    ) -> Result<PageAllocation<'static, ArchImpl>> {
+        let va = VA::from_value(va.value());
+
+        let mut fut = None;
+
+        loop {
+            if let Some(fut) = fut.take() {
+                // Handle async fault.
+                Box::into_pin(fut).await?;
+            }
+
+            let proc_vm = self.vm.shared_vm();
+
+            {
+                let mut vm = proc_vm.lock_save_irq();
+
+                if let Some(pa) = vm.mm_mut().address_space_mut().translate(va) {
+                    let region = pa.pfn.as_phys_range();
+
+                    if match access_kind {
+                        AccessKind::Read => pa.perms.is_read(),
+                        AccessKind::Write => pa.perms.is_write(),
+                        AccessKind::Execute => pa.perms.is_execute(),
+                    } {
+                        let alloc = unsafe { PAGE_ALLOC.get().unwrap().alloc_from_region(region) };
+                        // Increase refcount on this page, ensuring it isn't reused
+                        // while we copy the data.
+                        let ret = alloc.clone();
+
+                        // The original allocation is still owned by the address
+                        // space.
+                        alloc.leak();
+
+                        return Ok(ret);
+                    }
+                }
+            }
+
+            // Try to handle the fault.
+            match handle_demand_fault(proc_vm.clone(), va, access_kind)? {
+                // Resolved the fault.   Try again
+                FaultResolution::Resolved => continue,
+                FaultResolution::Denied => return Err(KernelError::Fault),
+                FaultResolution::Deferred(future) => {
+                    fut = Some(future);
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub fn update_utime(&self, now: Instant) {
+        let now = now.user_normalized();
+        let now = now.ticks() as usize;
+        let last_account = self.last_account.load(Ordering::Relaxed);
+        let delta = now.saturating_sub(last_account);
+        if self.is_idle_task() {
+            CPU_STAT.get().idle.fetch_add(delta, Ordering::Relaxed);
+        } else {
+            CPU_STAT.get().user.fetch_add(delta, Ordering::Relaxed);
+        }
+        self.utime.fetch_add(delta, Ordering::Relaxed);
+        self.process.utime.fetch_add(delta, Ordering::Relaxed);
+        self.last_account.store(now, Ordering::Relaxed);
+    }
+
+    pub fn update_stime(&self, now: Instant) {
+        let now = now.user_normalized();
+        let now = now.ticks() as usize;
+        let last_account = self.last_account.load(Ordering::Relaxed);
+        let delta = now.saturating_sub(last_account);
+        CPU_STAT.get().system.fetch_add(delta, Ordering::Relaxed);
+        self.stime.fetch_add(delta, Ordering::Relaxed);
+        self.process.stime.fetch_add(delta, Ordering::Relaxed);
+        self.last_account.store(now, Ordering::Relaxed);
+    }
+
+    pub fn reset_last_account(&self, now: Instant) {
+        let now = now.user_normalized();
+        let now = now.ticks() as usize;
+        self.last_account.store(now, Ordering::Relaxed);
+        self.last_account.store(now, Ordering::Relaxed);
     }
 }
 
-pub static TASK_LIST: SpinLock<BTreeMap<TaskDescriptor, Weak<SpinLock<TaskState>>>> =
-    SpinLock::new(BTreeMap::new());
+/// Finds a task by it's `Tid`.
+pub fn find_task_by_tid(tid: Tid) -> Option<Arc<Work>> {
+    TASK_LIST
+        .lock_save_irq()
+        .get(&tid)
+        .and_then(|x| x.upgrade())
+}
+
+pub static TASK_LIST: SpinLock<BTreeMap<Tid, Weak<Work>>> = SpinLock::new(BTreeMap::new());
 
 unsafe impl Send for Task {}
 unsafe impl Sync for Task {}

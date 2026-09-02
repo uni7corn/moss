@@ -2,6 +2,7 @@ use core::mem;
 
 use crate::{
     arch::arm64::{
+        boot::memory::KERNEL_STACK_AREA,
         exceptions::{
             ExceptionState,
             esr::{AbortIss, Exception, IfscCategory},
@@ -9,13 +10,18 @@ use crate::{
         memory::uaccess::UAccessResult,
     },
     memory::fault::{FaultResolution, handle_demand_fault, handle_protection_fault},
-    sched::{current_task, spawn_kernel_work},
+    process::{ProcVM, thread_group::signal::SigId},
+    sched::{current_work, spawn_kernel_work, syscall_ctx::ProcessCtx},
+    sync::SpinLock,
 };
-use alloc::boxed::Box;
+use alloc::{boxed::Box, sync::Arc};
 use libkernel::{
-    UserAddressSpace,
     error::Result,
-    memory::{address::VA, proc_vm::vmarea::AccessKind, region::VirtMemoryRegion},
+    memory::{
+        address::VA,
+        proc_vm::{address_space::UserAddressSpace, vmarea::AccessKind},
+        region::VirtMemoryRegion,
+    },
 };
 
 #[repr(C)]
@@ -35,18 +41,23 @@ impl FixupTable {
     }
 }
 
-fn run_mem_fault_handler(exception: Exception, info: AbortIss) -> Result<FaultResolution> {
+fn run_mem_fault_handler(
+    proc_vm: Arc<SpinLock<ProcVM>>,
+    exception: Exception,
+    info: AbortIss,
+) -> Result<FaultResolution> {
     let access_kind = determine_access_kind(exception, info);
 
     if let Some(far) = info.far {
         let fault_addr = VA::from_value(far as usize);
 
-        let task = current_task();
-        let mut vm = task.vm.lock_save_irq();
-
         match info.ifsc.category() {
-            IfscCategory::TranslationFault => handle_demand_fault(&mut vm, fault_addr, access_kind),
+            IfscCategory::TranslationFault => {
+                handle_demand_fault(proc_vm.clone(), fault_addr, access_kind)
+            }
             IfscCategory::PermissionFault => {
+                let mut vm = proc_vm.lock_save_irq();
+
                 let pg_info = vm
                     .mm_mut()
                     .address_space_mut()
@@ -63,10 +74,10 @@ fn run_mem_fault_handler(exception: Exception, info: AbortIss) -> Result<FaultRe
 }
 
 fn handle_uacess_abort(exception: Exception, info: AbortIss, state: &mut ExceptionState) {
-    match run_mem_fault_handler(exception, info) {
+    match run_mem_fault_handler(current_work().vm.shared_vm(), exception, info) {
         // We mapped in a page, the uacess handler can proceed.
         Ok(FaultResolution::Resolved) => (),
-        // If the fault coldn't be resolved, signal to the uacess fixup that
+        // If the fault couldn't be resolved, signal to the uacess fixup that
         // the abort failed.
         Ok(FaultResolution::Denied) => {
             state.x[0] = UAccessResult::AbortDenied as _;
@@ -100,23 +111,28 @@ pub fn handle_kernel_mem_fault(exception: Exception, info: AbortIss, state: &mut
     // If the source of the fault (ELR), wasn't in the uacess fixup section,
     // then any abort genereated by the kernel is a panic since we don't
     // demand-page any kernel memory.
-    panic!("Kernel memory fault detected.  Context: {}", state);
+    //
+    // Try and differentiate between a stack overflow condition and other
+    // faults.
+    if let Some(far) = info.far
+        && KERNEL_STACK_AREA.contains_address(VA::from_value(far as _))
+    {
+        panic!("Kernel stack overflow detected.  Context:\n{state}");
+    } else {
+        panic!("Kernel memory fault detected.  Context:\n{state}");
+    }
 }
 
-pub fn handle_mem_fault(exception: Exception, info: AbortIss) {
-    match run_mem_fault_handler(exception, info) {
+pub fn handle_mem_fault(ctx: &mut ProcessCtx, exception: Exception, info: AbortIss) {
+    match run_mem_fault_handler(ctx.shared().vm.shared_vm(), exception, info) {
         Ok(FaultResolution::Resolved) => {}
-        // TODO: Implement proc signals.
-        Ok(FaultResolution::Denied) => panic!(
-            "SIGSEGV on process {} {:?} PC: {:x}",
-            current_task().process.tgid,
-            exception,
-            current_task().ctx.lock_save_irq().user().elr_el1
-        ),
+        Ok(FaultResolution::Denied) => {
+            ctx.task().process.deliver_signal(SigId::SIGSEGV);
+        }
         // If the page fault involves sleepy kernel work, we can
         // spawn that work on the process, since there is no other
         // kernel work happening.
-        Ok(FaultResolution::Deferred(fut)) => spawn_kernel_work(async {
+        Ok(FaultResolution::Deferred(fut)) => spawn_kernel_work(ctx, async {
             if Box::into_pin(fut).await.is_err() {
                 panic!("Page fault defered error, SIGBUS on process");
             }

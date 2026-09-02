@@ -11,6 +11,7 @@ use crate::{
 };
 use alloc::{boxed::Box, string::String, sync::Arc, vec::Vec};
 use async_trait::async_trait;
+use core::any::Any;
 use log::warn;
 
 bitflags::bitflags! {
@@ -221,7 +222,7 @@ impl<T: Fat32Operations> Fat32DirStream<T> {
             let attr = FileAttr {
                 size: dir_entry.size as u64,
                 file_type,
-                mode: FilePermissions::from_bits_retain(0o755),
+                permissions: FilePermissions::from_bits_retain(0o755),
                 atime: fat_date_to_duration(dir_entry.adate),
                 mtime: fat_datetime_to_duration(dir_entry.mdate, dir_entry.mtime, 0),
                 ctime: fat_datetime_to_duration(
@@ -398,6 +399,10 @@ impl<T: Fat32Operations> Inode for Fat32DirNode<T> {
 
     async fn getattr(&self) -> Result<FileAttr> {
         Ok(self.attr.clone())
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 

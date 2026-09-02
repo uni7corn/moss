@@ -1,21 +1,30 @@
+use super::Fd;
+use crate::process::fd_table::dup::dup_fd;
+use crate::{process::fd_table::FdFlags, sched::syscall_ctx::ProcessCtx};
 use bitflags::Flags;
 use libkernel::error::{KernelError, Result};
-
-use crate::{process::fd_table::FdFlags, sched::current_task};
-
-use super::Fd;
+use libkernel::fs::OpenFlags;
 
 const F_DUPFD: u32 = 0; // Duplicate file descriptor.
 const F_GETFD: u32 = 1; // Get file descriptor flags.
 const F_SETFD: u32 = 2; // Set file descriptor flags.
 const F_GETFL: u32 = 3; // Get file status flags.
 const F_SETFL: u32 = 4; // Set file status flags.
+const F_LINUX_SPECIFIC_BASE: u32 = 1024;
+const F_DUPFD_CLOEXEC: u32 = F_LINUX_SPECIFIC_BASE + 6; // Duplicate file descriptor with FD_CLOEXEC.
 
-pub async fn sys_fcntl(fd: Fd, op: u32, arg: usize) -> Result<usize> {
-    let task = current_task();
+pub async fn sys_fcntl(ctx: &ProcessCtx, fd: Fd, op: u32, arg: usize) -> Result<usize> {
+    let task = ctx.shared();
 
     match op {
-        F_DUPFD => todo!(),
+        F_DUPFD => dup_fd(ctx, fd, Some(Fd(arg as i32))).map(|new_fd| new_fd.as_raw() as _),
+        F_DUPFD_CLOEXEC => {
+            let new_fd = dup_fd(ctx, fd, Some(Fd(arg as i32)))?;
+            task.fd_table
+                .lock_save_irq()
+                .add_flags(new_fd, FdFlags::CLOEXEC)?;
+            Ok(new_fd.as_raw() as _)
+        }
         F_GETFD => {
             let fds = task.fd_table.lock_save_irq();
             let fd = fds
@@ -54,7 +63,25 @@ pub async fn sys_fcntl(fd: Fd, op: u32, arg: usize) -> Result<usize> {
 
             Ok(open_fd.flags().await.bits() as _)
         }
-        F_SETFL => todo!(),
+        F_SETFL => {
+            let fl = OpenFlags::from_bits_retain(arg as _);
+            if fl.contains_unknown_bits() {
+                return Err(KernelError::InvalidValue);
+            }
+            let open_fd = {
+                let mut fds = task.fd_table.lock_save_irq();
+                let fd = fds
+                    .entries
+                    .get_mut(fd.as_raw() as usize)
+                    .and_then(|entry| entry.as_mut())
+                    .ok_or(KernelError::BadFd)?;
+
+                fd.file.clone()
+            };
+            // TODO: Ignore sync/dsync when implemented
+            open_fd.set_flags(fl).await;
+            Ok(0)
+        }
         _ => Err(KernelError::InvalidValue),
     }
 }

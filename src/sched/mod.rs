@@ -1,16 +1,97 @@
+use crate::arch::{Arch, ArchImpl};
 use crate::drivers::timer::now;
-use crate::{
-    arch::{Arch, ArchImpl},
-    per_cpu,
-    process::{TASK_LIST, Task, TaskDescriptor, TaskState},
-    sync::OnceLock,
-};
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc};
-use core::cmp::Ordering;
-use libkernel::{UserAddressSpace, error::Result};
+#[cfg(feature = "smp")]
+use crate::interrupts::cpu_messenger::{Message, message_cpu};
+use crate::kernel::cpu_id::CpuId;
+use crate::process::owned::OwnedTask;
+use crate::sched::sched_task::{CPU_MASK_SIZE, CpuMask};
+use crate::{per_cpu_private, per_cpu_shared, process::TASK_LIST};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+use core::fmt::Debug;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::task::Waker;
+use core::time::Duration;
+use log::warn;
+use runqueue::RunQueue;
+use sched_task::{RunnableTask, Work};
+use syscall_ctx::ProcessCtx;
+use waker::create_waker;
 
+mod runqueue;
+pub mod sched_task;
+pub mod syscall_ctx;
+pub mod syscalls;
 pub mod uspc_ret;
 pub mod waker;
+
+pub static NUM_CONTEXT_SWITCHES: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Default)]
+pub struct CpuStat<T>
+where
+    T: Debug + Default,
+{
+    pub user: T,
+    pub nice: T,
+    pub system: T,
+    pub idle: T,
+    pub iowait: T,
+    pub irq: T,
+    pub softirq: T,
+    pub steal: T,
+    pub guest: T,
+    pub guest_nice: T,
+}
+
+impl CpuStat<AtomicUsize> {
+    pub fn to_usize(&self) -> CpuStat<usize> {
+        CpuStat {
+            user: self.user.load(Ordering::Relaxed),
+            nice: self.nice.load(Ordering::Relaxed),
+            system: self.system.load(Ordering::Relaxed),
+            idle: self.idle.load(Ordering::Relaxed),
+            iowait: self.iowait.load(Ordering::Relaxed),
+            irq: self.irq.load(Ordering::Relaxed),
+            softirq: self.softirq.load(Ordering::Relaxed),
+            steal: self.steal.load(Ordering::Relaxed),
+            guest: self.guest.load(Ordering::Relaxed),
+            guest_nice: self.guest_nice.load(Ordering::Relaxed),
+        }
+    }
+}
+
+per_cpu_shared! {
+    pub static CPU_STAT: CpuStat<AtomicUsize> = CpuStat::default;
+}
+
+pub fn get_cpu_stat(cpu_id: CpuId) -> CpuStat<usize> {
+    CPU_STAT.get_by_cpu(cpu_id.value()).to_usize()
+}
+
+per_cpu_private! {
+    static SCHED_STATE: SchedState = SchedState::new;
+}
+
+per_cpu_shared! {
+    pub static SHARED_SCHED_STATE: SharedSchedState = SharedSchedState::new;
+}
+
+/// Default time-slice assigned to runnable tasks.
+const DEFAULT_TIME_SLICE: Duration = Duration::from_millis(4);
+
+/// Fixed-point configuration for virtual-time accounting.
+/// We now use a 65.63 format (65 integer bits, 63 fractional bits) as
+/// recommended by the EEVDF paper to minimise rounding error accumulation.
+pub const VT_FIXED_SHIFT: u32 = 63;
+pub const VT_ONE: u128 = 1u128 << VT_FIXED_SHIFT;
+/// Tolerance used when comparing virtual-time values (see EEVDF, Fixed-Point Arithmetic).
+/// Two virtual-time instants whose integer parts differ by no more than this constant are considered equal.
+pub const VCLOCK_EPSILON: u128 = VT_ONE;
+
+/// Scheduler base weight to ensure tasks always have a strictly positive
+/// scheduling weight. The value is added to a task's priority to obtain its
+/// effective weight (`w_i` in EEVDF paper).
+pub const SCHED_WEIGHT_BASE: i32 = 1024;
 
 /// Schedule a new task.
 ///
@@ -24,210 +105,193 @@ pub mod waker;
 /// 3. If the selected process is the same as the currently running one, no
 ///    switch occurs.
 /// 4. If a new process is selected, it handles the state transitions (`Running`
-///    -&gt; `Runnable` for the old task, `Runnable` -&gt; `Running` for the new task)
-///    and performs the architecture-specific context switch.
+///   > `Runnable` for the old task, `Runnable` > `Running` for the new task)
+///   > and performs the architecture-specific context switch.
 ///
 /// # Returns
 ///
 /// Nothing, but the CPU context will be set to the next runnable task. See
 /// `userspace_return` for how this is invoked.
 fn schedule() {
-    // Mark the current task as runnable so it's considered for scheduling in
-    // the next time-slice.
-    {
-        let task = current_task();
-        let mut task_state = task.state.lock_save_irq();
-
-        if *task_state == TaskState::Running {
-            *task_state = TaskState::Runnable;
-        }
+    // Reentrancy Check
+    if SCHED_STATE.try_borrow_mut().is_none() {
+        warn!(
+            "Scheduler reentrancy detected on CPU {}",
+            CpuId::this().value()
+        );
+        return;
     }
 
-    let previous_task = current_task();
-    let mut sched_state = SCHED_STATE.borrow_mut();
-    let next_task = sched_state.find_next_runnable_task();
+    let deferred = SCHED_STATE.borrow_mut().do_schedule();
 
-    sched_state
-        .switch_to_task(Some(previous_task), next_task.clone())
-        .expect("Could not schedule next task");
+    // Drop the old RunnableTask outside the SCHED_STATE borrow. This ensures
+    // that any destructors that may be called by dropping the task will be
+    // called without SCHED_STATE borrowed, e.g. closeing the other end of a
+    // pipe.
+    drop(deferred);
 }
 
-pub fn spawn_kernel_work(fut: impl Future<Output = ()> + 'static + Send) {
-    current_task()
-        .ctx
-        .lock_save_irq()
-        .put_kernel_work(Box::pin(fut));
+pub fn spawn_kernel_work(ctx: &mut ProcessCtx, fut: impl Future<Output = ()> + 'static + Send) {
+    ctx.task_mut().ctx.put_kernel_work(Box::pin(fut));
 }
 
-/// Insert the given task onto *this* CPUs runqueue.
-pub fn insert_task(task: Arc<Task>) {
-    SCHED_STATE
-        .borrow_mut()
-        .run_queue
-        .insert(task.descriptor(), task);
+#[cfg(feature = "smp")]
+fn get_best_cpu(cpu_mask: CpuMask) -> CpuId {
+    let r = 0..ArchImpl::cpu_count();
+    r.enumerate()
+        // Filter to only CPUs in the mask
+        .filter(|(i, _)| {
+            let byte_index = i / 8;
+            let bit_index = i % 8;
+            (cpu_mask[byte_index] & (1 << bit_index)) != 0
+        })
+        .map(|(_, cpu_id)| cpu_id)
+        // Find optimal CPU based on least run queue weight
+        .min_by(|&x, &y| {
+            // TODO: Find a way to calculate already assigned affinities and account for that
+            let info_x = SHARED_SCHED_STATE.get_by_cpu(x);
+            let info_y = SHARED_SCHED_STATE.get_by_cpu(y);
+            let weight_x = info_x.total_runq_weight.load(Ordering::Relaxed);
+            let weight_y = info_y.total_runq_weight.load(Ordering::Relaxed);
+            weight_x.cmp(&weight_y)
+        })
+        .map(CpuId::from_value)
+        .unwrap_or_else(|| {
+            warn!("No CPUs found when trying to get best CPU! Defaulting to CPU 0");
+            CpuId::from_value(0)
+        })
+}
+
+/// Insert the given task onto a CPU's run queue.
+pub fn insert_work(work: Arc<Work>) {
+    SCHED_STATE.borrow_mut().run_q.add_work(work);
+}
+
+#[cfg(feature = "smp")]
+pub fn insert_work_cross_cpu(work: Arc<Work>) {
+    let sched_data = work.sched_data.lock_save_irq();
+    let last_cpu = sched_data
+        .as_ref()
+        .map(|s| s.last_cpu)
+        .unwrap_or(usize::MAX);
+    let mask = sched_data
+        .as_ref()
+        .map(|s| s.cpu_mask)
+        .unwrap_or([u8::MAX; CPU_MASK_SIZE]);
+    let cpu = if last_cpu == usize::MAX {
+        get_best_cpu(mask)
+    } else {
+        // Check if the last CPU is still in the affinity mask, and if so, prefer it to improve cache locality.
+        let byte_index = last_cpu / 8;
+        let bit_index = last_cpu % 8;
+        if (mask[byte_index] & (1 << bit_index)) != 0 {
+            CpuId::from_value(last_cpu)
+        } else {
+            get_best_cpu(mask)
+        }
+    };
+    drop(sched_data);
+    if cpu == CpuId::this() {
+        SCHED_STATE.borrow_mut().run_q.add_work(work);
+    } else {
+        message_cpu(cpu, Message::EnqueueWork(work)).expect("Failed to send task to CPU");
+    }
+}
+
+#[cfg(not(feature = "smp"))]
+pub fn insert_work_cross_cpu(task: Arc<Work>) {
+    insert_work(task);
 }
 
 pub struct SchedState {
-    running_task: Option<Arc<Task>>,
-    pub run_queue: BTreeMap<TaskDescriptor, Arc<Task>>,
+    run_q: RunQueue,
 }
 
 unsafe impl Send for SchedState {}
 
 impl SchedState {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
-            running_task: None,
-            run_queue: BTreeMap::new(),
+            run_q: RunQueue::new(),
         }
     }
 
-    fn switch_to_task(
-        &mut self,
-        previous_task: Option<Arc<Task>>,
-        next_task: Arc<Task>,
-    ) -> Result<()> {
+    /// Update the global least-tasked CPU info atomically.
+    #[cfg(feature = "smp")]
+    fn update_global_least_tasked_cpu_info(&self) {
+        let weight = self.run_q.weight();
+        SHARED_SCHED_STATE
+            .get()
+            .total_runq_weight
+            .store(weight, Ordering::Relaxed);
+    }
+
+    #[cfg(not(feature = "smp"))]
+    fn update_global_least_tasked_cpu_info(&self) {
+        // No-op on single-core systems.
+    }
+
+    pub fn do_schedule(&mut self) -> Vec<RunnableTask> {
+        self.update_global_least_tasked_cpu_info();
+
         let now_inst = now().expect("System timer not initialised");
 
-        if let Some(ref prev_task) = previous_task {
-            *prev_task.last_run.lock_save_irq() = Some(now_inst);
-        }
-
-        if let Some(ref prev_task) = previous_task
-            && Arc::ptr_eq(&next_task, prev_task)
         {
-            // Ensure the task state is running.
-            *next_task.state.lock_save_irq() = TaskState::Running;
-            return Ok(());
+            let current = self.run_q.current_mut();
+
+            current.work.task.update_accounting(Some(now_inst));
+
+            // Reset accounting baseline after updating stats to avoid double-counting
+            // the same time interval on the next scheduler tick.
+            current.work.reset_last_account(now_inst);
         }
 
-        // Update vruntime and clear exec_start for the previous task.
-        if let Some(ref prev_task) = previous_task {
-            if let Some(start) = *prev_task.exec_start.lock_save_irq() {
-                let delta = now_inst - start;
-                *prev_task.vruntime.lock_save_irq() += delta.as_nanos() as u64;
-            }
-            *prev_task.exec_start.lock_save_irq() = None;
-        }
-
-        // Record the start time for the task we are about to run.
-        *next_task.exec_start.lock_save_irq() = Some(now_inst);
-
-        // Context switch, the previous task's state should already been updated
-        // prior to calling this function.
-        if let Some(ref prev_task) = previous_task {
-            debug_assert_eq!(*prev_task.state.lock_save_irq(), TaskState::Runnable);
-        }
-
-        *next_task.state.lock_save_irq() = TaskState::Running;
-
-        // Update the scheduler's state to reflect the new running task.
-        self.running_task = Some(next_task.clone());
-
-        // Perform the architecture-specific context switch.
-        ArchImpl::context_switch(next_task);
-
-        Ok(())
-    }
-
-    fn find_next_runnable_task(&self) -> Arc<Task> {
-        let idle_task = self
-            .run_queue
-            .get(&TaskDescriptor::this_cpus_idle())
-            .expect("Every runqueue should have an idle task");
-
-        self.run_queue
-            .values()
-            // We only care about processes that are ready to run.
-            .filter(|candidate_proc| {
-                let state = *candidate_proc.state.lock_save_irq();
-                // A process is a candidate if it's runnable and NOT the idle task
-                state == TaskState::Runnable && !candidate_proc.is_idle_task()
-            })
-            .min_by(|proc1, proc2| {
-                let vr1 = *proc1.vruntime.lock_save_irq();
-                let vr2 = *proc2.vruntime.lock_save_irq();
-
-                vr1.cmp(&vr2).then_with(|| {
-                    // Tie-breaker: fall back to last run timestamp.
-                    let last_run1 = proc1.last_run.lock_save_irq();
-                    let last_run2 = proc2.last_run.lock_save_irq();
-
-                    match (*last_run1, *last_run2) {
-                        (Some(t1), Some(t2)) => t1.cmp(&t2),
-                        (Some(_), None) => Ordering::Less,
-                        (None, Some(_)) => Ordering::Greater,
-                        (None, None) => Ordering::Equal,
-                    }
-                })
-            })
-            .unwrap_or(idle_task)
-            .clone()
+        self.run_q.schedule(now_inst)
     }
 }
 
-per_cpu! {
-    pub static SCHED_STATE: SchedState = SchedState::new;
+pub struct SharedSchedState {
+    pub total_runq_weight: AtomicU64,
 }
 
-pub fn current_task() -> Arc<Task> {
-    SCHED_STATE
-        .borrow()
-        .running_task
-        .as_ref()
-        .expect("Current task called before initial task created")
-        .clone()
+impl SharedSchedState {
+    pub fn new() -> Self {
+        Self {
+            total_runq_weight: AtomicU64::new(0),
+        }
+    }
 }
 
 pub fn sched_init() {
-    let idle_task = get_idle_task();
-    let init_task = Arc::new(Task::create_init_task());
+    let init_task = OwnedTask::create_init_task();
 
-    init_task
-        .vm
-        .lock_save_irq()
-        .mm_mut()
-        .address_space_mut()
-        .activate();
-
-    *init_task.state.lock_save_irq() = TaskState::Running;
+    let init_work = Work::new(Box::new(init_task));
 
     {
         let mut task_list = TASK_LIST.lock_save_irq();
 
-        task_list.insert(idle_task.descriptor(), Arc::downgrade(&idle_task.state));
-        task_list.insert(init_task.descriptor(), Arc::downgrade(&init_task.state));
+        task_list.insert(
+            init_work.task.descriptor().tid(),
+            Arc::downgrade(&init_work),
+        );
     }
 
-    insert_task(idle_task);
-    insert_task(init_task.clone());
+    insert_work(init_work);
 
-    SCHED_STATE
-        .borrow_mut()
-        .switch_to_task(None, init_task)
-        .expect("Failed to switch to init task");
+    schedule();
 }
 
 pub fn sched_init_secondary() {
-    let idle_task = get_idle_task();
+    // Force update_global_least_tasked_cpu_info
+    SCHED_STATE.borrow().update_global_least_tasked_cpu_info();
 
-    insert_task(idle_task.clone());
-
-    SCHED_STATE
-        .borrow_mut()
-        .switch_to_task(None, idle_task)
-        .expect("Failed to swtich to idle task");
-}
-
-fn get_idle_task() -> Arc<Task> {
-    static IDLE_TASK: OnceLock<Arc<Task>> = OnceLock::new();
-
-    IDLE_TASK
-        .get_or_init(|| Arc::new(ArchImpl::create_idle_task()))
-        .clone()
-}
-
-pub fn sys_sched_yield() -> Result<usize> {
     schedule();
-    Ok(0)
+}
+
+pub fn current_work() -> Arc<Work> {
+    SCHED_STATE.borrow().run_q.current().work.clone()
+}
+
+pub fn current_work_waker() -> Waker {
+    create_waker(current_work())
 }

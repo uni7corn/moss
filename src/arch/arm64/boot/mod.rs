@@ -1,7 +1,13 @@
 use super::{
     exceptions::{ExceptionState, secondary_exceptions_init},
-    memory::{fixmap::FIXMAPS, mmu::setup_kern_addr_space},
+    memory::{
+        fixmap::FIXMAPS,
+        heap::{KernelHeap, SLAB_ALLOC},
+        mmu::setup_kern_addr_space,
+    },
+    proc::vdso::vdso_init,
 };
+use crate::drivers::timer::kick_current_cpu;
 use crate::{
     arch::{ArchImpl, arm64::exceptions::exceptions_init},
     console::setup_console_logger,
@@ -9,10 +15,7 @@ use crate::{
         fdt_prober::{probe_for_fdt_devices, set_fdt_va},
         init::run_initcalls,
     },
-    interrupts::{
-        cpu_messenger::{Message, cpu_messenger_init, message_cpu},
-        get_interrupt_root,
-    },
+    interrupts::{cpu_messenger::cpu_messenger_init, get_interrupt_root},
     kmain,
     memory::{INITAL_ALLOCATOR, PAGE_ALLOC},
     sched::{sched_init_secondary, uspc_ret::dispatch_userspace_task},
@@ -24,11 +27,12 @@ use aarch64_cpu::{
 use core::arch::global_asm;
 use libkernel::{
     CpuOps,
-    arch::arm64::memory::pg_tables::{L0Table, PgTableArray},
+    arch::arm64::memory::pg_tables::L0Table,
     error::Result,
     memory::{
         address::{PA, TPA, VA},
-        page_alloc::FrameAllocator,
+        allocators::{phys::FrameAllocator, slab::allocator::SlabAllocator},
+        paging::PgTableArray,
     },
     sync::per_cpu::setup_percpu,
 };
@@ -38,13 +42,13 @@ use secondary::{boot_secondaries, cpu_count, save_idmap, secondary_booted};
 
 mod exception_level;
 mod logical_map;
-mod memory;
+pub(super) mod memory;
 mod paging_bootstrap;
-mod secondary;
+pub(super) mod secondary;
 
 global_asm!(include_str!("start.s"));
 
-/// Stage 1 Initialize of the system architechture.
+/// Stage 1 Initialize of the system architecture.
 ///
 /// This function is called by the main primary CPU with the other CPUs parked.
 /// All interrupts should be disabled, the ID map setup in TTBR0 and the highmem
@@ -54,8 +58,8 @@ global_asm!(include_str!("start.s"));
 ///
 /// 0xffff_0000_0000_0000 - 0xffff_8000_0000_0000 | Logical Memory Map
 /// 0xffff_8000_0000_0000 - 0xffff_8000_1fff_ffff | Kernel image
+/// 0xffff_8100_0000_0000 - 0xffff_8100_0000_1000 | VDSO (userspace)
 /// 0xffff_9000_0000_0000 - 0xffff_9000_0020_1fff | Fixed mappings
-/// 0xffff_b000_0000_0000 - 0xffff_b000_0400_0000 | Kernel Heap
 /// 0xffff_b800_0000_0000 - 0xffff_b800_0000_8000 | Kernel Stack (per CPU)
 /// 0xffff_d000_0000_0000 - 0xffff_d000_ffff_ffff | MMIO remap
 /// 0xffff_e000_0000_0000 - 0xffff_e000_0000_0800 | Exception Vector Table
@@ -105,11 +109,17 @@ fn arch_init_stage2(frame: *mut ExceptionState) -> *mut ExceptionState {
         .take()
         .expect("Smalloc should not have been taken yet");
 
-    let page_alloc = unsafe { FrameAllocator::init(smalloc) };
+    let (page_alloc, frame_list) = unsafe { FrameAllocator::init(smalloc) };
 
     if PAGE_ALLOC.set(page_alloc).is_err() {
         panic!("Cannot setup physical memory allocator");
     }
+
+    if SLAB_ALLOC.set(SlabAllocator::new(frame_list)).is_err() {
+        panic!("Cannot setup slab allocator");
+    }
+
+    KernelHeap::init_for_this_cpu();
 
     // Don't trap wfi/wfe in el0.
     SCTLR_EL1.modify(SCTLR_EL1::NTWE::DontTrap + SCTLR_EL1::NTWI::DontTrap);
@@ -124,6 +134,10 @@ fn arch_init_stage2(frame: *mut ExceptionState) -> *mut ExceptionState {
 
     cpu_messenger_init(cpu_count());
 
+    if let Err(e) = vdso_init() {
+        panic!("VDSO setup failed: {e}");
+    }
+
     let cmdline = super::fdt::get_cmdline();
 
     kmain(cmdline.unwrap_or_default(), frame);
@@ -131,8 +145,6 @@ fn arch_init_stage2(frame: *mut ExceptionState) -> *mut ExceptionState {
     boot_secondaries();
 
     // Prove that we can send IPIs through the messenger.
-    let _ = message_cpu(1, Message::Ping(ArchImpl::id() as _));
-
     frame
 }
 
@@ -141,12 +153,21 @@ fn arch_init_secondary(ctx_frame: *mut ExceptionState) -> *mut ExceptionState {
     TCR_EL1.modify(TCR_EL1::EPD0::DisableTTBR0Walks);
     barrier::isb(barrier::SY);
 
+    // Don't trap secondaries wfi/wfe in el0.
+    SCTLR_EL1.modify(SCTLR_EL1::NTWE::DontTrap + SCTLR_EL1::NTWI::DontTrap);
+
+    // Setup heap per-cpu data.
+    KernelHeap::init_for_this_cpu();
+
     // Enable interrupts and exceptions.
     secondary_exceptions_init();
 
     if let Some(ic) = get_interrupt_root() {
         ic.enable_core(ArchImpl::id());
     }
+
+    // Arm the per-CPU system timer so this core starts receiving timer IRQs.
+    kick_current_cpu();
 
     ArchImpl::enable_interrupts();
 

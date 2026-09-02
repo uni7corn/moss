@@ -1,14 +1,32 @@
-use crate::{ArchImpl, arch::Arch};
-use libkernel::error::{KernelError, Result};
+use crate::{ArchImpl, arch::Arch, sched::syscall_ctx::ProcessCtx};
+use core::sync::atomic::AtomicBool;
+use libkernel::{
+    error::{KernelError, Result},
+    proc::caps::CapabilitiesFlags,
+};
 
-pub async fn sys_reboot(magic: u32, magic2: u32, op: u32, _arg: usize) -> Result<usize> {
+pub static CAD_ENABLED: AtomicBool = AtomicBool::new(false);
+
+pub async fn sys_reboot(
+    ctx: &ProcessCtx,
+    magic: u32,
+    magic2: u32,
+    op: u32,
+    _arg: usize,
+) -> Result<usize> {
+    ctx.shared()
+        .creds
+        .lock_save_irq()
+        .caps()
+        .check_capable(CapabilitiesFlags::CAP_SYS_BOOT)?;
+
     const LINUX_REBOOT_MAGIC1: u32 = 0xfee1_dead;
     const LINUX_REBOOT_MAGIC2: u32 = 672274793;
     const LINUX_REBOOT_MAGIC2A: u32 = 852072454;
     const LINUX_REBOOT_MAGIC2B: u32 = 369367448;
     const LINUX_REBOOT_MAGIC2C: u32 = 537993216;
-    // const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x0000_0000;
-    // const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
+    const LINUX_REBOOT_CMD_CAD_OFF: u32 = 0x0000_0000;
+    const LINUX_REBOOT_CMD_CAD_ON: u32 = 0x89ab_cdef;
     // const LINUX_REBOOT_CMD_HALT: u32 = 0xcdef_0123;
     // const LINUX_REBOOT_CMD_KEXEC: u32 = 0x4558_4543;
     const LINUX_REBOOT_CMD_POWER_OFF: u32 = 0x4321_fedc;
@@ -29,6 +47,14 @@ pub async fn sys_reboot(magic: u32, magic2: u32, op: u32, _arg: usize) -> Result
             ArchImpl::power_off()
         }
         LINUX_REBOOT_CMD_RESTART => ArchImpl::restart(),
+        LINUX_REBOOT_CMD_CAD_ON => {
+            CAD_ENABLED.store(true, core::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+        LINUX_REBOOT_CMD_CAD_OFF => {
+            CAD_ENABLED.store(false, core::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
         // TODO: Implement other reboot operations.
         _ => Err(KernelError::InvalidValue),
     }

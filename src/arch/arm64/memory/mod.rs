@@ -1,16 +1,11 @@
-use core::{
-    alloc::{GlobalAlloc, Layout},
-    ptr::NonNull,
-};
+use core::arch::asm;
 
 use libkernel::memory::address::{PA, VA};
-use linked_list_allocator::Heap;
-
-use crate::sync::SpinLock;
 
 pub mod address_space;
 pub mod fault;
 pub mod fixmap;
+pub mod heap;
 pub mod mmu;
 pub mod tlb;
 pub mod uaccess;
@@ -23,29 +18,6 @@ pub const EXCEPTION_BASE: VA = VA::from_value(0xffff_e000_0000_0000);
 
 const BOGUS_START: PA = PA::from_value(usize::MAX);
 static mut KIMAGE_START: PA = BOGUS_START;
-
-pub struct SpinlockHeap(pub SpinLock<Heap>);
-
-#[global_allocator]
-pub static HEAP_ALLOCATOR: SpinlockHeap = SpinlockHeap(SpinLock::new(Heap::empty()));
-
-unsafe impl GlobalAlloc for SpinlockHeap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.0
-            .lock_save_irq()
-            .allocate_first_fit(layout)
-            .ok()
-            .map_or(core::ptr::null_mut(), |allocation| allocation.as_ptr())
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe {
-            self.0
-                .lock_save_irq()
-                .deallocate(NonNull::new_unchecked(ptr), layout)
-        }
-    }
-}
 
 #[macro_export]
 macro_rules! ksym_pa {
@@ -89,4 +61,27 @@ pub fn translate_kernel_va(addr: VA) -> PA {
     v -= IMAGE_BASE.value();
 
     PA::from_value(v + get_kimage_start().value())
+}
+
+pub fn flush_to_ram<T>(x: *const T) {
+    let mut stride: usize = 0;
+
+    // Calc  cache line stride.
+    unsafe { asm!("mrs {0}, ctr_el0", out(reg) stride, options(nostack, nomem)) };
+    stride = (1 << ((stride >> 16) & 0xf)) * 4;
+
+    let end = unsafe { x.byte_add(size_of::<T>()) } as usize;
+    let mut addr = (x as usize) & !(stride - 1); // align down
+
+    while addr < end {
+        // Clear the cache line for the given VA.
+        unsafe {
+            asm!("dc cvac, {0}", in(reg) addr, options(nostack));
+
+            addr += stride;
+        }
+    }
+
+    // Ensure the cache maintaince op has finished.
+    unsafe { asm!("dsb ish", options(nostack)) };
 }

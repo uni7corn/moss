@@ -12,9 +12,10 @@
 use core::cmp;
 
 use crate::{
-    fs::Inode,
+    fs::{Inode, InodeId},
     memory::{PAGE_MASK, PAGE_SIZE, address::VA, region::VirtMemoryRegion},
 };
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use object::{
     Endian,
@@ -25,12 +26,16 @@ use object::{
 /// Describes the permissions assigned for this VMA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VMAPermissions {
+    /// Whether reads are allowed.
     pub read: bool,
+    /// Whether writes are allowed.
     pub write: bool,
+    /// Whether execution is allowed.
     pub execute: bool,
 }
 
 impl VMAPermissions {
+    /// Read-write permissions.
     pub const fn rw() -> Self {
         Self {
             read: true,
@@ -39,6 +44,7 @@ impl VMAPermissions {
         }
     }
 
+    /// Read-execute permissions.
     pub const fn rx() -> Self {
         Self {
             read: true,
@@ -47,6 +53,7 @@ impl VMAPermissions {
         }
     }
 
+    /// Read-only permissions.
     pub const fn ro() -> Self {
         Self {
             read: true,
@@ -56,14 +63,14 @@ impl VMAPermissions {
     }
 }
 
-/// Describes the kind of access that occured during a page fault.
+/// Describes the kind of access that occurred during a page fault.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AccessKind {
     /// The CPU attempted to read the faulting address.
     Read,
     /// The CPU attempted to write to the faulting address.
     Write,
-    /// The CPU attempted to execute the instruciton at the faulting address.
+    /// The CPU attempted to execute the instruction at the faulting address.
     Execute,
 }
 
@@ -155,10 +162,12 @@ pub enum VMAreaKind {
 }
 
 impl VMAreaKind {
+    /// Creates a new anonymous VMA kind.
     pub fn new_anon() -> Self {
         Self::Anon
     }
 
+    /// Creates a new file-backed VMA kind.
     pub fn new_file(file: Arc<dyn Inode>, offset: u64, len: u64) -> Self {
         Self::File(VMFileMapping { file, offset, len })
     }
@@ -172,7 +181,9 @@ impl VMAreaKind {
 /// managing a process's memory layout.
 #[derive(Clone, PartialEq)]
 pub struct VMArea {
-    pub(super) region: VirtMemoryRegion,
+    /// The virtual address range of this VMA.
+    pub region: VirtMemoryRegion,
+    pub(super) name: String,
     pub(super) kind: VMAreaKind,
     pub(super) permissions: VMAPermissions,
 }
@@ -189,7 +200,13 @@ impl VMArea {
             region,
             kind,
             permissions,
+            name: String::new(),
         }
+    }
+
+    /// Sets a human-readable name for this VMA (e.g. `[stack]`, `[heap]`).
+    pub fn set_name<S: AsRef<str>>(&mut self, s: S) {
+        self.name = s.as_ref().to_string();
     }
 
     /// Creates a file-backed `VMArea` directly from an ELF program header.
@@ -199,17 +216,21 @@ impl VMArea {
     /// memory permissions.
     ///
     /// Note: If a program header's VA isn't page-aligned this function will
-    /// align it down and addjust the offset and size accordingly.
+    /// align it down and adjust the offset and size accordingly.
     ///
     /// # Arguments
     /// * `f`: A handle to the ELF file's inode.
     /// * `hdr`: The ELF program header (`LOAD` segment) to create the VMA from.
     /// * `endian`: The endianness of the ELF file, for correctly parsing header fields.
+    /// * `address_bias`: A bias added to the VAs of the segment.
     pub fn from_pheader<E: Endian>(
         f: Arc<dyn Inode>,
         hdr: ProgramHeader64<E>,
         endian: E,
+        address_bias: Option<usize>,
     ) -> VMArea {
+        let address_bias = address_bias.unwrap_or(0);
+
         let mut permissions = VMAPermissions {
             read: false,
             write: false,
@@ -229,7 +250,7 @@ impl VMArea {
         }
 
         let mappable_region = VirtMemoryRegion::new(
-            VA::from_value(hdr.p_vaddr(endian) as usize),
+            VA::from_value(hdr.p_vaddr(endian) as usize + address_bias),
             hdr.p_memsz(endian) as usize,
         )
         .to_mappable_region();
@@ -242,6 +263,7 @@ impl VMArea {
                 len: hdr.p_filesz(endian) + mappable_region.offset() as u64,
             }),
             permissions,
+            name: String::new(),
         }
     }
 
@@ -254,9 +276,9 @@ impl VMArea {
     ///
     /// # Returns
     ///
-    /// - [`AccessValidation::Valid`]: If the address and permissions are valid.
-    /// - [`AccessValidation::NotPresent`]: If the address is outside this VMA.
-    /// - [`AccessValidation::PermissionDenied`]: If the address is inside this
+    /// - [`FaultValidation::Valid`]: If the address and permissions are valid.
+    /// - [`FaultValidation::NotPresent`]: If the address is outside this VMA.
+    /// - [`FaultValidation::PermissionDenied`]: If the address is inside this
     ///   VMA but the access is not allowed. This allows the caller to immediately
     ///   identify a segmentation fault without checking other VMAs.
     pub fn validate_fault(&self, addr: VA, kind: AccessKind) -> FaultValidation {
@@ -359,10 +381,12 @@ impl VMArea {
         })
     }
 
+    /// Returns the memory permissions for this VMA.
     pub fn permissions(&self) -> VMAPermissions {
         self.permissions
     }
 
+    /// Returns `true` if the given virtual address falls within this VMA.
     pub fn contains_address(&self, addr: VA) -> bool {
         self.region.contains_address(addr)
     }
@@ -446,11 +470,39 @@ impl VMArea {
             VMAreaKind::Anon => new_vma,
         }
     }
+
+    /// Return the virtual memory region managed by this VMA.
+    pub fn region(&self) -> VirtMemoryRegion {
+        self.region
+    }
+
+    /// Returns the file offset for a file-backed VMA, or `None` for anonymous mappings.
+    pub fn file_offset(&self) -> Option<u64> {
+        match self.kind {
+            VMAreaKind::File(ref vmfile_mapping) => Some(vmfile_mapping.offset()),
+            VMAreaKind::Anon => None,
+        }
+    }
+
+    /// Returns the inode ID of the backing file, or `None` for anonymous mappings.
+    pub fn inode_id(&self) -> Option<InodeId> {
+        match self.kind {
+            VMAreaKind::File(ref vmfile_mapping) => Some(vmfile_mapping.file().id()),
+            VMAreaKind::Anon => None,
+        }
+    }
+
+    /// Returns the human-readable name of this VMA.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 #[cfg(test)]
+#[allow(missing_docs)]
 pub mod tests {
     use crate::fs::InodeId;
+    use core::any::Any;
 
     use super::*;
     use async_trait::async_trait;
@@ -462,6 +514,10 @@ pub mod tests {
     impl Inode for DummyTestInode {
         fn id(&self) -> InodeId {
             unreachable!("Not called")
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
         }
     }
 

@@ -9,7 +9,9 @@ use libkernel::{
 };
 use ringbuf::Arc;
 
-use crate::{memory::uaccess::copy_to_user_slice, process::fd_table::Fd, sched::current_task};
+use crate::{
+    memory::uaccess::copy_to_user_slice, process::fd_table::Fd, sched::syscall_ctx::ProcessCtx,
+};
 
 use super::{fops::FileOps, open_file::FileCtx};
 
@@ -131,8 +133,8 @@ struct Dirent64Hdr {
     _kind: DirentFileType,
 }
 
-pub async fn sys_getdents64(fd: Fd, mut ubuf: UA, size: u32) -> Result<usize> {
-    let task = current_task();
+pub async fn sys_getdents64(ctx: &ProcessCtx, fd: Fd, mut ubuf: UA, size: u32) -> Result<usize> {
+    let task = ctx.shared().clone();
     let file = task
         .fd_table
         .lock_save_irq()

@@ -3,7 +3,7 @@ use libkernel::error::{KernelError, Result};
 use libkernel::memory::address::TUA;
 
 use crate::memory::uaccess::{UserCopyable, copy_from_user, copy_to_user};
-use crate::sched::current_task;
+use crate::sched::syscall_ctx::ProcessCtx;
 
 use super::ksigaction::UserspaceSigAction;
 use super::uaccess::UserSigId;
@@ -88,21 +88,20 @@ impl From<SigActionState> for UserSigAction {
 }
 
 pub async fn sys_rt_sigaction(
+    ctx: &ProcessCtx,
     sig: UserSigId,
     act: TUA<UserSigAction>,
     oact: TUA<UserSigAction>,
     sigsetsize: usize,
 ) -> Result<usize> {
-    let task = current_task();
-
     if sigsetsize != size_of::<SigSet>() {
-        Err(KernelError::InvalidValue)?
+        return Err(KernelError::InvalidValue);
     }
 
     let sig: SigId = sig.try_into()?;
 
     if sig == SigId::SIGKILL || sig == SigId::SIGSTOP {
-        Err(KernelError::InvalidValue)?
+        return Err(KernelError::InvalidValue);
     }
 
     let new_act = if !act.is_null() {
@@ -112,12 +111,13 @@ pub async fn sys_rt_sigaction(
     };
 
     let old_action = {
-        let sigstate = task.process.signals.lock_save_irq();
-        let mut action_table = sigstate.action.lock_save_irq();
-        let old_action = action_table[sig];
+        let task = ctx.shared();
+
+        let mut sigstate = task.process.signals.lock_save_irq();
+        let old_action = sigstate.action[sig];
 
         if let Some(new_action) = new_act {
-            action_table[sig] = new_action.into();
+            sigstate.action[sig] = new_action.into();
         }
 
         old_action

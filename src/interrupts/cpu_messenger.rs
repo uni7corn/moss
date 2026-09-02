@@ -1,9 +1,17 @@
 //! A module for sending messages between CPUs, utilising IPIs.
 
+use core::task::Waker;
+
+use super::{
+    ClaimedInterrupt, InterruptConfig, InterruptDescriptor, InterruptHandler, get_interrupt_root,
+};
+use crate::kernel::cpu_id::CpuId;
+use crate::sched::sched_task::Work;
 use crate::{
     arch::ArchImpl,
     drivers::Driver,
     kernel::kpipe::KBuf,
+    sched,
     sync::{OnceLock, SpinLock},
 };
 use alloc::{sync::Arc, vec::Vec};
@@ -11,17 +19,12 @@ use libkernel::{
     CpuOps,
     error::{KernelError, Result},
 };
-use log::{info, warn};
+use log::warn;
 
-use super::{
-    ClaimedInterrupt, InterruptConfig, InterruptDescriptor, InterruptHandler, get_interrupt_root,
-};
-
-#[derive(Clone)]
 pub enum Message {
-    // Reschedule,
-    // PutTask(Arc<Task>),
-    Ping(u32),
+    EnqueueWork(Arc<Work>),
+    #[expect(unused)]
+    WakeupTask(Waker),
 }
 
 struct CpuMessenger {
@@ -37,22 +40,19 @@ impl Driver for CpuMessenger {
 
 impl InterruptHandler for CpuMessenger {
     fn handle_irq(&self, _desc: InterruptDescriptor) {
-        let message = CPU_MESSENGER
+        while let Some(message) = CPU_MESSENGER
             .get()
             .unwrap()
             .mailboxes
             .lock_save_irq()
             .get(ArchImpl::id())
             .unwrap()
-            .try_pop();
-
-        match message {
-            // Some(Message::Reschedule) => return, // We reschedule when returning from an IRQ.
-            // Some(Message::PutTask(task)) => sched::insert_task(task),
-            Some(Message::Ping(cpu_id)) => {
-                info!("CPU {} recieved ping from CPU {}", ArchImpl::id(), cpu_id)
+            .try_pop()
+        {
+            match message {
+                Message::EnqueueWork(work) => sched::insert_work(work),
+                Message::WakeupTask(waker) => waker.wake(),
             }
-            None => warn!("Spurious CPU IPI"),
         }
     }
 }
@@ -61,7 +61,7 @@ const MESSENGER_IRQ_DESC: InterruptDescriptor = InterruptDescriptor::Ipi(0);
 
 pub fn cpu_messenger_init(num_cpus: usize) {
     let cpu_messenger = get_interrupt_root()
-        .expect("Interrupt root should be avilable")
+        .expect("Interrupt root should be available")
         .claim_interrupt(
             InterruptConfig {
                 descriptor: MESSENGER_IRQ_DESC,
@@ -87,19 +87,19 @@ pub fn cpu_messenger_init(num_cpus: usize) {
     }
 }
 
-pub fn message_cpu(cpu_id: usize, message: Message) -> Result<()> {
+pub fn message_cpu(cpu_id: CpuId, message: Message) -> Result<()> {
     let messenger = CPU_MESSENGER.get().ok_or(KernelError::InvalidValue)?;
     let irq = get_interrupt_root().ok_or(KernelError::InvalidValue)?;
 
     messenger
         .mailboxes
         .lock_save_irq()
-        .get(cpu_id)
+        .get(cpu_id.value())
         .ok_or(KernelError::InvalidValue)?
         .try_push(message)
         .map_err(|_| KernelError::NoMemory)?;
 
-    irq.raise_ipi(cpu_id);
+    irq.raise_ipi(cpu_id.value());
 
     Ok(())
 }

@@ -8,15 +8,24 @@
 //! The rest of the kernel should use the `ArchImpl` type alias to access
 //! architecture-specific functions and types.
 
-use crate::process::{
-    Task,
-    thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
+use crate::{
+    memory::uaccess::UserCopyable,
+    process::{
+        Task,
+        owned::OwnedTask,
+        thread_group::signal::{SigId, ksigaction::UserspaceSigAction},
+    },
+    sched::syscall_ctx::ProcessCtx,
 };
+use alloc::string::String;
 use alloc::sync::Arc;
 use libkernel::{
-    CpuOps, VirtualMemory,
+    CpuOps,
     error::Result,
-    memory::address::{UA, VA},
+    memory::{
+        address::{UA, VA},
+        proc_vm::address_space::VirtualMemory,
+    },
 };
 
 pub trait Arch: CpuOps + VirtualMemory {
@@ -25,7 +34,15 @@ pub trait Arch: CpuOps + VirtualMemory {
     /// with this type.
     type UserContext: Sized + Send + Sync + Clone;
 
+    /// The type for GP regs copied via `PTRACE_GETREGSET`.
+    type PTraceGpRegs: UserCopyable + for<'a> From<&'a Self::UserContext>;
+
+    /// The starting address for the logical mapping of all physical ram.
+    const PAGE_OFFSET: usize;
+
     fn name() -> &'static str;
+
+    fn cpu_count() -> usize;
 
     /// Prepares the initial context for a new user-space thread. This sets up
     /// the stack frame so that when we context-switch to it, it will begin
@@ -37,7 +54,7 @@ pub trait Arch: CpuOps + VirtualMemory {
     fn context_switch(new: Arc<Task>);
 
     /// Construct a new idle task.
-    fn create_idle_task() -> Task;
+    fn create_idle_task() -> OwnedTask;
 
     /// Powers off the machine. Implementations must never return.
     fn power_off() -> !;
@@ -45,14 +62,19 @@ pub trait Arch: CpuOps + VirtualMemory {
     /// Restarts the machine. Implementations must never return.
     fn restart() -> !;
 
+    fn get_cmdline() -> Option<String>;
+
     /// Call a user-specified signal handler in the current process.
     fn do_signal(
+        ctx: ProcessCtx,
         sig: SigId,
         action: UserspaceSigAction,
     ) -> impl Future<Output = Result<<Self as Arch>::UserContext>>;
 
     /// Return from a userspace signal handler.
-    fn do_signal_return() -> impl Future<Output = Result<<Self as Arch>::UserContext>>;
+    fn do_signal_return(
+        ctx: ProcessCtx,
+    ) -> impl Future<Output = Result<<Self as Arch>::UserContext>>;
 
     /// Copies a block of memory from userspace to the kernel.
     ///

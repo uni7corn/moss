@@ -1,0 +1,147 @@
+use super::{
+    Comm, ITimers, Task, Tid, VmHandle,
+    creds::Credentials,
+    ctx::{Context, UserCtx},
+    fd_table::FileDescriptorTable,
+    ptrace::PTrace,
+    thread_group::{
+        Tgid,
+        builder::ThreadGroupBuilder,
+        signal::{AtomicSigSet, SignalActionState},
+    },
+    threading::RobustListHead,
+};
+use crate::{arch::Arch, fs::DummyInode, sync::SpinLock};
+use crate::{
+    arch::ArchImpl,
+    drivers::timer::{Instant, now},
+};
+use alloc::sync::Arc;
+use core::ops::Deref;
+use core::sync::atomic::AtomicUsize;
+use libkernel::{
+    fs::pathbuf::PathBuf,
+    memory::{
+        address::{TUA, VA},
+        proc_vm::{ProcessVM, address_space::VirtualMemory, vmarea::VMArea},
+    },
+    sync::waker_set::WakerSet,
+};
+
+/// Task state which is exclusively owned by this CPU/runqueue, it is not shared
+/// between other tasks and can therefore be access lock-free.
+pub struct OwnedTask {
+    pub ctx: Context,
+    pub priority: Option<i8>,
+    pub robust_list: Option<TUA<RobustListHead>>,
+    pub child_tid_ptr: Option<TUA<u32>>,
+    pub t_shared: Arc<Task>,
+    pub in_syscall: bool,
+}
+
+unsafe impl Send for OwnedTask {}
+unsafe impl Sync for OwnedTask {}
+
+impl Deref for OwnedTask {
+    type Target = Task;
+
+    fn deref(&self) -> &Self::Target {
+        &self.t_shared
+    }
+}
+
+impl OwnedTask {
+    pub fn create_idle_task(
+        addr_space: <ArchImpl as VirtualMemory>::ProcessAddressSpace,
+        user_ctx: UserCtx,
+        code_map: VMArea,
+    ) -> Self {
+        // SAFETY: The code page will have been mapped corresponding to the VMA.
+        let vm = unsafe { ProcessVM::from_vma_and_address_space(code_map, addr_space) };
+
+        let thread_group_builder = ThreadGroupBuilder::new(Tgid::idle())
+            .with_priority(i8::MIN)
+            .with_sigstate(Arc::new(SpinLock::new(SignalActionState::new_ignore())));
+
+        let task = Task {
+            tid: Tid::idle_for_cpu(),
+            comm: Arc::new(SpinLock::new(Comm::new("idle"))),
+            process: thread_group_builder.build(),
+            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
+            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
+            creds: SpinLock::new(Credentials::new_root()),
+            vm: Arc::new(VmHandle::new(vm)),
+            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
+            i_timers: SpinLock::new(ITimers::default()),
+            ptrace: SpinLock::new(PTrace::new()),
+            utime: AtomicUsize::new(0),
+            stime: AtomicUsize::new(0),
+            last_account: AtomicUsize::new(0),
+            pending_signals: AtomicSigSet::empty(),
+            signal_notifier: SpinLock::new(WakerSet::new()),
+            sig_mask: AtomicSigSet::empty(),
+        };
+
+        Self {
+            priority: Some(i8::MIN),
+            ctx: Context::from_user_ctx(user_ctx),
+            robust_list: None,
+            child_tid_ptr: None,
+            t_shared: Arc::new(task),
+            in_syscall: false,
+        }
+    }
+
+    pub fn create_init_task() -> Self {
+        let task = Task {
+            tid: Tid(1),
+            comm: Arc::new(SpinLock::new(Comm::new("init"))),
+            process: ThreadGroupBuilder::new(Tgid::init()).build(),
+            cwd: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
+            root: Arc::new(SpinLock::new((Arc::new(DummyInode {}), PathBuf::new()))),
+            creds: SpinLock::new(Credentials::new_root()),
+            vm: Arc::new(VmHandle::new(
+                ProcessVM::empty().expect("Could not create init process's VM"),
+            )),
+            i_timers: SpinLock::new(ITimers::default()),
+            fd_table: Arc::new(SpinLock::new(FileDescriptorTable::new())),
+            ptrace: SpinLock::new(PTrace::new()),
+            last_account: AtomicUsize::new(0),
+            utime: AtomicUsize::new(0),
+            stime: AtomicUsize::new(0),
+            pending_signals: AtomicSigSet::empty(),
+            signal_notifier: SpinLock::new(WakerSet::new()),
+            sig_mask: AtomicSigSet::empty(),
+        };
+
+        Self {
+            priority: None,
+            ctx: Context::from_user_ctx(<ArchImpl as Arch>::new_user_context(
+                VA::null(),
+                VA::null(),
+            )),
+            robust_list: None,
+            child_tid_ptr: None,
+            t_shared: Arc::new(task),
+            in_syscall: false,
+        }
+    }
+
+    pub fn priority(&self) -> i8 {
+        self.priority
+            .unwrap_or_else(|| *self.process.priority.lock_save_irq())
+    }
+
+    pub fn set_priority(&mut self, priority: i8) {
+        self.priority = Some(priority);
+    }
+
+    pub fn update_accounting(&self, curr_time: Option<Instant>) {
+        let now = curr_time.unwrap_or_else(|| now().unwrap());
+        if self.in_syscall {
+            self.update_stime(now);
+        } else {
+            self.update_utime(now);
+        }
+    }
+}

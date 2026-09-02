@@ -1,17 +1,30 @@
-use super::{ctx::Context, thread_group::signal::SigSet};
+use super::owned::OwnedTask;
+use super::ptrace::{PTrace, TracePoint, ptrace_stop};
+use super::{ITimers, Tid, VmHandle};
+use super::{
+    ctx::Context,
+    thread_group::signal::{AtomicSigSet, SigSet},
+};
 use crate::memory::uaccess::copy_to_user;
+use crate::sched::sched_task::Work;
+use crate::sched::syscall_ctx::ProcessCtx;
 use crate::{
-    process::{TASK_LIST, Task, TaskState},
-    sched::{self, current_task},
+    process::{TASK_LIST, Task},
+    sched::{self},
     sync::SpinLock,
 };
+use alloc::boxed::Box;
 use bitflags::bitflags;
+use core::sync::atomic::AtomicUsize;
 use libkernel::memory::address::TUA;
 use libkernel::{
     error::{KernelError, Result},
     memory::address::UA,
+    sync::waker_set::WakerSet,
 };
 use ringbuf::Arc;
+
+pub static NUM_FORKS: AtomicUsize = AtomicUsize::new(0);
 
 bitflags! {
     #[derive(Debug)]
@@ -43,6 +56,7 @@ bitflags! {
 }
 
 pub async fn sys_clone(
+    ctx: &ProcessCtx,
     flags: u32,
     newsp: UA,
     parent_tidptr: TUA<u32>,
@@ -51,20 +65,32 @@ pub async fn sys_clone(
 ) -> Result<usize> {
     let flags = CloneFlags::from_bits_truncate(flags);
 
+    let trace_point = if flags.contains(CloneFlags::CLONE_THREAD) {
+        TracePoint::Clone
+    } else {
+        TracePoint::Fork
+    };
+
+    // TODO: differentiate between `TracePoint::Fork`, `TracePoint::Clone` and
+    // `TracePoint::VFork`.
+    let should_trace_new_tsk = ptrace_stop(ctx, trace_point).await;
+
     let new_task = {
-        let current_task = current_task();
+        let tid = Tid::next_tid();
 
-        let mut user_ctx = *current_task.ctx.lock_save_irq().user();
+        let current_task = ctx.task();
 
-        // TODO: Make this arch indepdenant. The child returns '0' on clone.
+        let mut user_ctx = *current_task.ctx.user();
+
+        // TODO: Make this arch independent. The child returns '0' on clone.
         user_ctx.x[0] = 0;
 
         if flags.contains(CloneFlags::CLONE_SETTLS) {
-            // TODO: Make this arch indepdenant.
+            // TODO: Make this arch independent.
             user_ctx.tpid_el0 = tls as _;
         }
 
-        let (tg, tid) = if flags.contains(CloneFlags::CLONE_THREAD) {
+        let tg = if flags.contains(CloneFlags::CLONE_THREAD) {
             if !flags.contains(CloneFlags::CLONE_SIGHAND & CloneFlags::CLONE_VM) {
                 // CLONE_THREAD requires both CLONE_SIGHAND and CLONE_VM to be
                 // set.
@@ -72,14 +98,11 @@ pub async fn sys_clone(
             }
             user_ctx.sp_el0 = newsp.value() as _;
 
-            (
-                // A new task whtin this thread group.
-                current_task.process.clone(),
-                current_task.process.next_tid(),
-            )
+            // A new task within this thread group.
+            current_task.process.clone()
         } else {
             let tgid_parent = if flags.contains(CloneFlags::CLONE_PARENT) {
-                // Use the parnent's parent as the new parent.
+                // Use the parent's parent as the new parent.
                 current_task
                     .process
                     .parent
@@ -93,23 +116,24 @@ pub async fn sys_clone(
                 current_task.process.clone()
             };
 
-            tgid_parent.new_child(flags.contains(CloneFlags::CLONE_SIGHAND))
+            tgid_parent.new_child(flags.contains(CloneFlags::CLONE_SIGHAND), tid)
         };
 
         let vm = if flags.contains(CloneFlags::CLONE_VM) {
-            current_task.vm.clone()
+            if flags.contains(CloneFlags::CLONE_THREAD) {
+                current_task.vm.clone()
+            } else {
+                Arc::new(VmHandle::from_shared(current_task.vm.shared_vm()))
+            }
         } else {
-            Arc::new(SpinLock::new(
-                current_task.vm.lock_save_irq().clone_as_cow()?,
-            ))
+            let proc_vm = current_task.vm.shared_vm();
+            Arc::new(VmHandle::new(proc_vm.lock_save_irq().clone_as_cow()?))
         };
 
         let files = if flags.contains(CloneFlags::CLONE_FILES) {
             current_task.fd_table.clone()
         } else {
-            Arc::new(SpinLock::new(
-                current_task.fd_table.lock_save_irq().clone_for_exec(),
-            ))
+            Arc::new(SpinLock::new(current_task.fd_table.lock_save_irq().clone()))
         };
 
         let cwd = if flags.contains(CloneFlags::CLONE_FS) {
@@ -124,52 +148,90 @@ pub async fn sys_clone(
             Arc::new(SpinLock::new(current_task.root.lock_save_irq().clone()))
         };
 
+        let ptrace = if flags.contains(CloneFlags::CLONE_PTRACE) || should_trace_new_tsk {
+            current_task.ptrace.lock_save_irq().clone()
+        } else {
+            PTrace::new()
+        };
+
         let creds = current_task.creds.lock_save_irq().clone();
 
-        let new_sigmask = *current_task.sig_mask.lock_save_irq();
+        let new_sigmask = AtomicSigSet::new(current_task.sig_mask.load());
 
-        Task {
-            tid,
-            comm: Arc::new(SpinLock::new(*current_task.comm.lock_save_irq())),
-            process: tg,
-            vm,
-            fd_table: files,
-            cwd,
-            root,
-            creds: SpinLock::new(creds),
-            ctx: SpinLock::new(Context::from_user_ctx(user_ctx)),
+        let initial_signals = if should_trace_new_tsk {
+            // When we want to trace a new task through one of
+            // PTRACE_O_TRACE{FORK,VFORK,CLONE}, stop the child as soon as
+            // it is created.
+            AtomicSigSet::new(SigSet::SIGSTOP)
+        } else {
+            AtomicSigSet::empty()
+        };
+
+        OwnedTask {
+            ctx: Context::from_user_ctx(user_ctx),
             priority: current_task.priority,
-            sig_mask: SpinLock::new(new_sigmask),
-            pending_signals: SpinLock::new(SigSet::empty()),
-            vruntime: SpinLock::new(0),
-            exec_start: SpinLock::new(None),
-            deadline: SpinLock::new(*current_task.deadline.lock_save_irq()),
-            state: Arc::new(SpinLock::new(TaskState::Runnable)),
-            last_run: SpinLock::new(None),
-            robust_list: SpinLock::new(None),
-            child_tid_ptr: SpinLock::new(if !child_tidptr.is_null() {
+            robust_list: None,
+            child_tid_ptr: if !child_tidptr.is_null() {
                 Some(child_tidptr)
             } else {
                 None
+            },
+            t_shared: Arc::new(Task {
+                tid,
+                comm: Arc::new(SpinLock::new(*current_task.comm.lock_save_irq())),
+                process: tg,
+                vm,
+                fd_table: files,
+                cwd,
+                root,
+                i_timers: SpinLock::new(ITimers::default()),
+                creds: SpinLock::new(creds),
+                ptrace: SpinLock::new(ptrace),
+                sig_mask: new_sigmask,
+                pending_signals: initial_signals,
+                signal_notifier: SpinLock::new(WakerSet::new()),
+                utime: AtomicUsize::new(0),
+                stime: AtomicUsize::new(0),
+                last_account: AtomicUsize::new(0),
             }),
+            in_syscall: false,
         }
     };
 
+    if flags.contains(CloneFlags::CLONE_VFORK) {
+        new_task.process.start_vfork();
+    }
+
+    let desc = new_task.descriptor();
+    let work = Work::new(Box::new(new_task));
+    let vfork_process = flags
+        .contains(CloneFlags::CLONE_VFORK)
+        .then(|| work.process.clone());
+
     TASK_LIST
         .lock_save_irq()
-        .insert(new_task.descriptor(), Arc::downgrade(&new_task.state));
+        .insert(desc.tid(), Arc::downgrade(&work));
 
-    let tid = new_task.tid;
+    work.process
+        .tasks
+        .lock_save_irq()
+        .insert(desc.tid, Arc::downgrade(&work));
 
-    sched::insert_task(Arc::new(new_task));
+    sched::insert_work_cross_cpu(work);
+
+    NUM_FORKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
     // Honour CLONE_*SETTID semantics for the parent and (shared-VM) child.
     if flags.contains(CloneFlags::CLONE_PARENT_SETTID) && !parent_tidptr.is_null() {
-        copy_to_user(parent_tidptr, tid.value()).await?;
+        copy_to_user(parent_tidptr, desc.tid.value()).await?;
     }
     if flags.contains(CloneFlags::CLONE_CHILD_SETTID) && !child_tidptr.is_null() {
-        copy_to_user(child_tidptr, tid.value()).await?;
+        copy_to_user(child_tidptr, desc.tid.value()).await?;
     }
 
-    Ok(tid.value() as _)
+    if let Some(vfork_process) = vfork_process {
+        vfork_process.wait_for_vfork_release().await;
+    }
+
+    Ok(desc.tid.value() as _)
 }

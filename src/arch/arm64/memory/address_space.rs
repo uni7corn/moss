@@ -10,23 +10,26 @@ use aarch64_cpu::{
 };
 use alloc::vec::Vec;
 use libkernel::{
-    PageInfo, UserAddressSpace,
     arch::arm64::memory::{
-        pg_descriptors::{L3Descriptor, MemoryType, PaMapper, PageTableEntry},
-        pg_tables::{
-            L0Table, MapAttributes, MappingContext, PageAllocator, PgTableArray, map_range,
-        },
-        pg_walk::{WalkContext, get_pte, walk_and_modify_region},
+        pg_descriptors::{L3Descriptor, MemoryType},
+        pg_tables::{L0Table, MapAttributes, MappingContext, map_range},
+        pg_tear_down::tear_down_address_space,
+        pg_walk::{get_pte, walk_and_modify_region},
     },
     error::{KernelError, MapError, Result},
     memory::{
         PAGE_SIZE,
         address::{TPA, VA},
         page::PageFrame,
-        permissions::PtePermissions,
+        paging::{
+            PaMapper, PageAllocator, PageTableEntry, PgTableArray, permissions::PtePermissions,
+            tear_down::TeardownAction, walk::WalkContext,
+        },
+        proc_vm::address_space::{PageInfo, UserAddressSpace},
         region::{PhysMemoryRegion, VirtMemoryRegion},
     },
 };
+use log::warn;
 
 pub struct Arm64ProcessAddressSpace {
     l0_table: TPA<PgTableArray<L0Table>>,
@@ -196,5 +199,27 @@ impl UserAddressSpace for Arm64ProcessAddressSpace {
                 pgd
             }
         })
+    }
+}
+
+impl Drop for Arm64ProcessAddressSpace {
+    fn drop(&mut self) {
+        let mut walk_ctx = WalkContext {
+            mapper: &mut PageOffsetPgTableMapper {},
+            invalidator: &AllEl0TlbInvalidator::new(),
+        };
+
+        if tear_down_address_space(
+            self.l0_table,
+            &mut walk_ctx,
+            |_| TeardownAction::Free,
+            |region| unsafe {
+                PAGE_ALLOC.get().unwrap().alloc_from_region(region);
+            },
+        )
+        .is_err()
+        {
+            warn!("Address space tear down failed.  Probable memory leakage!");
+        }
     }
 }

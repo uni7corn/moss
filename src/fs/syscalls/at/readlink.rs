@@ -1,8 +1,11 @@
 use crate::{
-    fs::{VFS, syscalls::at::resolve_at_start_node},
+    fs::{
+        VFS,
+        syscalls::at::{AtFlags, resolve_at_start_node},
+    },
     memory::uaccess::{copy_to_user_slice, cstr::UserCStr},
     process::fd_table::Fd,
-    sched::current_task,
+    sched::syscall_ctx::ProcessCtx,
 };
 use core::{cmp::min, ffi::c_char};
 use libkernel::{
@@ -11,22 +14,27 @@ use libkernel::{
     memory::address::{TUA, UA},
 };
 
-pub async fn sys_readlinkat(dirfd: Fd, path: TUA<c_char>, buf: UA, size: usize) -> Result<usize> {
+pub async fn sys_readlinkat(
+    ctx: &ProcessCtx,
+    dirfd: Fd,
+    path: TUA<c_char>,
+    buf: UA,
+    size: usize,
+) -> Result<usize> {
     let mut path_buf = [0; 1024];
 
-    let task = current_task();
+    let task = ctx.shared().clone();
     let path = Path::new(
         UserCStr::from_ptr(path)
             .copy_from_user(&mut path_buf)
             .await?,
     );
 
-    let start = resolve_at_start_node(dirfd, path).await?;
+    let start = resolve_at_start_node(ctx, dirfd, path, AtFlags::empty()).await?;
     let name = path.file_name().ok_or(FsError::InvalidInput)?;
 
     let parent = if let Some(p) = path.parent() {
-        VFS.resolve_path_nofollow(p, start.clone(), task.clone())
-            .await?
+        VFS.resolve_path_nofollow(p, start.clone(), &task).await?
     } else {
         start
     };

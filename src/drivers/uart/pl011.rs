@@ -13,10 +13,10 @@ use arm_pl011_uart::{
 };
 use core::ptr::NonNull;
 use libkernel::{
-    KernAddressSpace, VirtualMemory,
     error::{ProbeError, Result},
     memory::{
         address::{PA, VA},
+        proc_vm::address_space::{KernAddressSpace, VirtualMemory},
         region::PhysMemoryRegion,
     },
 };
@@ -68,7 +68,6 @@ impl UartDriver for PL011 {
     }
 
     fn drain_uart_rx(&mut self, buf: &mut [u8]) -> usize {
-        self.inner.clear_interrupts(Interrupts::RXI);
         let mut bytes_read = 0;
 
         while !self.inner.is_rx_fifo_empty() && bytes_read < buf.len() {
@@ -78,6 +77,11 @@ impl UartDriver for PL011 {
             } else {
                 break;
             }
+        }
+
+        // Ack the RX interrupt after draining.
+        if bytes_read > 0 || self.inner.is_rx_fifo_empty() {
+            self.inner.clear_interrupts(Interrupts::RXI);
         }
 
         bytes_read
@@ -103,7 +107,7 @@ pub fn pl011_probe(dm: &mut DriverManager, d: DeviceDescriptor) -> Result<Arc<dy
 
             let interrupt_node = fdt_node
                 .interrupt_parent()
-                .ok_or(ProbeError::NoParentIntterupt)?
+                .ok_or(ProbeError::NoParentInterrupt)?
                 .node;
 
             let interrupt_manager = dm
